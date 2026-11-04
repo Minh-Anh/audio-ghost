@@ -182,6 +182,18 @@ Record the numbers here once measured, with the date.
   - Small visible changes: ear height applies at the next session start; the HUD's fix counters now
     work in desk simulation; CSV note rows `gps stale`/`gps weak`/`gps recovered`/`calibration x` are
     gone because the `state …` rows already record them.
+- **2026-11-04 — GPS banners no longer get swallowed (`GPSHealthMonitor`).** The heartbeat's
+  `gpsDegraded` Bool was replaced by a small pure type that records *which* complaint the reducer
+  was actually sent (`DegradedReason?`). Two bugs fixed: (1) the flag latched during
+  `.awaitingCalibration`, where the reducer ignores GPS complaints, so a weak or stale spell that
+  began before calibrating never produced a banner once running; nothing is recorded as delivered
+  there now, while the weak-fix timer keeps running so the complaint fires as soon as the session
+  runs. (2) `accuracyPoor → gpsLost` was unreachable; staleness now escalates it. Each complaint
+  is still sent once, not at 25 Hz, `gpsLost` never downgrades, and only a strong fix (≤
+  `weakAccuracy`) sends `.gpsRecovered`. Reducer table unchanged. `GPSHealthMonitorTests` covers
+  it clock-free; `testSustainedWeakFixesDegradeTheSession` now outlasts the timeout before
+  calibrating (it previously calibrated early, which hid bug 1). **Written without Xcode: not
+  yet compiled or run** — run the suite before the field walk.
 
 ## 5. Tuning constants
 

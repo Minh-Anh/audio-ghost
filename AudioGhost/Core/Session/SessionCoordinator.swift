@@ -75,8 +75,7 @@ final class SessionCoordinator {
     @ObservationIgnored private var ghostENU: SIMD3<Double>?
     @ObservationIgnored private var lastAttitudeYaw: Double = 0
     @ObservationIgnored private var lastSnapshotTime: TimeInterval = 0
-    @ObservationIgnored private var poorAccuracySince: TimeInterval?
-    @ObservationIgnored private var gpsDegraded = false
+    @ObservationIgnored private var gpsHealth = GPSHealthMonitor()
     @ObservationIgnored private var lastRejectionReason = ""
 
     init(store: GhostStore, debug: DebugSettings, frames: FrameConfigStore) {
@@ -108,8 +107,7 @@ final class SessionCoordinator {
             self.trackingGhost = ghost
             self.ghostENU = nil
             self.fixes.reset()
-            self.gpsDegraded = false
-            self.poorAccuracySince = nil
+            self.gpsHealth.reset()
         }
         send(.startRequested)
     }
@@ -315,9 +313,6 @@ final class SessionCoordinator {
 
     /// Every accepted fix: place the ghost on the first one, then run course-based drift correction.
     private func handle(_ fix: SmoothedFix) {
-        let isStrongFix = fix.horizontalAccuracy <= Tuning.current.weakAccuracy
-        if isStrongFix { poorAccuracySince = nil }
-
         if ghostENU == nil, let ghost = trackingGhost {
             let enu = ghost.enuPosition(origin: fix.origin)
             ghostENU = enu
@@ -331,9 +326,8 @@ final class SessionCoordinator {
 
         // Recovery requires a *good* fix: a stream of weak ones is exactly what `.accuracyPoor`
         // is complaining about, so it must not clear itself.
-        if gpsDegraded, isStrongFix {
-            gpsDegraded = false
-            send(.gpsRecovered)
+        if let event = gpsHealth.fixAccepted(horizontalAccuracy: fix.horizontalAccuracy) {
+            send(event)
         }
         send(.firstFixAccepted)     // no-ops in every state but `.acquiringFix`
     }
@@ -343,25 +337,16 @@ final class SessionCoordinator {
     ///   * `.accuracyPoor` — fixes are arriving, but they are consistently weak for
     ///                       `accuracyPoorTimeout`. This is the "GPS is weak here" case, and it
     ///                       is checked *before* the staleness threshold can mask it.
+    /// While awaiting calibration the weak-fix timer runs but nothing is sent (the reducer
+    /// ignores it there); `GPSHealthMonitor` sends it once the session is running.
     private func checkGPSHealth(now: TimeInterval, fix: SmoothedFix?) {
         guard state.shouldPlayAudio || state == .awaitingCalibration, let fix else { return }
 
-        if now - fix.timestamp > Tuning.current.gpsStaleTimeout {
-            if !gpsDegraded {
-                gpsDegraded = true
-                send(.gpsWentStale)
-            }
-            return
-        }
-
-        if fix.horizontalAccuracy > Tuning.current.weakAccuracy {
-            if poorAccuracySince == nil { poorAccuracySince = now }
-            if let since = poorAccuracySince, now - since > Tuning.current.accuracyPoorTimeout, !gpsDegraded {
-                gpsDegraded = true
-                send(.gpsAccuracyPoor)
-            }
-        } else {
-            poorAccuracySince = nil
+        if let event = gpsHealth.check(now: now,
+                                       fixTimestamp: fix.timestamp,
+                                       horizontalAccuracy: fix.horizontalAccuracy,
+                                       canDeliver: state.shouldPlayAudio) {
+            send(event)
         }
     }
 

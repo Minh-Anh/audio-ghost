@@ -179,6 +179,12 @@ final class SessionIntegrationTests: XCTestCase {
         // GPS complaints are suppressed until the session is actually running — while awaiting
         // calibration the banner has something more actionable to say.
         expect("reaches awaitingCalibration", timeout: 10) { session.state == .awaitingCalibration }
+
+        // Let the weak spell outlast the timeout *before* calibrating. The complaint must not be
+        // spent while the reducer ignores it, or the banner never appears once running.
+        // (A lower-bound wait only: a slow machine makes this slower, not flaky.)
+        RunLoop.current.run(until: Date().addingTimeInterval(1.5))
+        XCTAssertEqual(session.state, .awaitingCalibration)
         session.applyCalibration(offset: 0)
 
         expect("degrades on weak GPS", timeout: 10) {
