@@ -11,7 +11,7 @@ answers S3–S5). See "Open on device" below.
 ## 1. Build & test
 
 ```bash
-# Unit + integration tests (simulator; 129 tests)
+# Unit + integration tests (simulator; 133 tests)
 xcodebuild -project AudioGhost.xcodeproj -scheme AudioGhost \
   -destination 'platform=iOS Simulator,name=iPhone 17' test
 
@@ -182,6 +182,17 @@ Record the numbers here once measured, with the date.
   - Small visible changes: ear height applies at the next session start; the HUD's fix counters now
     work in desk simulation; CSV note rows `gps stale`/`gps weak`/`gps recovered`/`calibration x` are
     gone because the `state …` rows already record them.
+- **2026-11-04 — course updates need a fresh attitude yaw.** `SessionCoordinator.handle(_ fix:)`
+  ran `updateWithCourse` on every fix, including while the AirPods were out. GPS keeps going during a
+  disconnect, so after 15 m it seeded a `.coarse` offset from `lastAttitudeYaw`, which still belonged to
+  the *old* CoreMotion reference frame. On reconnect the reducer saw `.coarse` and skipped the prompt,
+  and an offset more than 60° off was never corrected (`courseGateAngle` rejects every fix).
+  Now the coordinator keeps a tracking-queue `lastAttitudeTime`, set by each head sample and cleared at
+  session start and (synchronously, before the event is sent) on disconnect. Course updates go
+  through `SessionCoordinator.courseUpdate`, which skips them unless a sample arrived within
+  `Tuning.current.motionStaleTimeout`. Ghost placement, GPS recovery and `.firstFixAccepted` still run
+  on every fix. Skipped fixes add no seed distance, because `invalidate()` already cleared the last
+  course fix. Pinned by `CourseFreshnessTests`. Not verified on hardware.
 
 ## 5. Tuning constants
 
@@ -216,7 +227,7 @@ written on the main queue only; everything else stays on `trackingQueue`.
 
 ## 7. Testing
 
-129 tests, all green in the simulator:
+133 tests, all green in the simulator:
 
 - `WrapMathTests` / `GeoTests` — Appendix A contracts and Appendix B worked vectors.
 - `FrameTests` — the three canonical §6.6 tests, run against **three different sensor-frame

@@ -7,7 +7,7 @@ A GPS-anchored spatial audio "ghost" for iOS. You place a sound at a real-world 
 - Status: everything indoors is verified on hardware. The first field walk hasn't happened yet.
 
 ```bash
-# Tests (simulator, 129 tests)
+# Tests (simulator, 133 tests)
 xcodebuild -project AudioGhost.xcodeproj -scheme AudioGhost \
   -destination 'platform=iOS Simulator,name=iPhone 17' test
 ```
@@ -97,7 +97,7 @@ trueYaw = attitudeYaw + yawOffset
 - **Compass ritual (`precise`):** hold the phone like a compass for about 2 s; offset = heading − attitudeYaw.
 - **GPS course (`coarse`):** walk 15 m and assume you're facing your direction of travel. While walking, the same signal also corrects drift slowly (gain 0.02 per fix), skipping any fix more than 60° off, since that's probably a glance.
 
-Disconnecting the AirPods invalidates the calibration.
+Disconnecting the AirPods invalidates the calibration. Course updates only run while head samples are fresh (one within `motionStaleTimeout`), so walking with the AirPods out can't seed a coarse offset from the old frame's yaw.
 
 ### Position: distrust every fix
 
@@ -154,7 +154,7 @@ Attitude → `attitudeYaw` → add `yawOffset` → `listenerRotation` → predic
 
 **AirPods out and back in**
 
-1. Disconnect sends `.airpodsDisconnected`: `paused`, stop the sound, invalidate calibration. The route change usually also fires and may overwrite the pause reason.
+1. Disconnect sends `.airpodsDisconnected`: `paused`, stop the sound, invalidate calibration. The route change usually also fires and may overwrite the pause reason. GPS fixes keep arriving, but `courseUpdate` skips them until a head sample arrives from the new reference frame, and the skipped distance doesn't count toward the 15 m seed.
 2. Reconnect sends the event matching the current pause reason. With calibration gone, state becomes `.awaitingCalibration`, audio resumes, and the ritual is prompted.
 
 ## 6. Threads
@@ -181,7 +181,6 @@ Found while reviewing the code, and deliberately not changed by the refactor. No
 
 | Severity | Issue | Where |
 |---|---|---|
-| High | **Walking with the AirPods out can lock in a wrong calibration.** Course seeding keeps running during the disconnect, using the last yaw from the old reference frame. After 15 m it marks calibration `coarse`, so reconnecting skips the prompt. If the offset is more than 60° off, drift correction ignores it, so it stays wrong until you recalibrate. | `SessionCoordinator.handle(_ fix:)` |
 | High | **Replace audio, then Cancel, loses the saved ghost's sound.** The old file is deleted during import, before Save. | `GhostEditorView.adopt(importing:)` |
 | Medium | **GPS banners can get swallowed.** `gpsDegraded` is set while awaiting calibration even though the reducer ignores the event, so the banner never appears once running until a strong fix clears the flag. The same flag makes `accuracyPoor → gpsLost` unreachable. | `SessionCoordinator.checkGPSHealth` |
 | Low | `state` is read on the tracking queue while main writes it, which is an unsynchronised read. | `checkGPSHealth`, `appendLogRow` |

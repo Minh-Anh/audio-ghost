@@ -74,6 +74,10 @@ final class SessionCoordinator {
     /// Nil until the session's first accepted fix fixes the ENU origin.
     @ObservationIgnored private var ghostENU: SIMD3<Double>?
     @ObservationIgnored private var lastAttitudeYaw: Double = 0
+    /// When `lastAttitudeYaw` was last refreshed by a head sample (`AppClock` seconds). Nil until
+    /// the first sample of the session, and cleared on AirPods disconnect: after that,
+    /// `lastAttitudeYaw` belongs to a reference frame that no longer exists.
+    @ObservationIgnored private var lastAttitudeTime: TimeInterval?
     @ObservationIgnored private var lastSnapshotTime: TimeInterval = 0
     @ObservationIgnored private var poorAccuracySince: TimeInterval?
     @ObservationIgnored private var gpsDegraded = false
@@ -110,6 +114,7 @@ final class SessionCoordinator {
             self.fixes.reset()
             self.gpsDegraded = false
             self.poorAccuracySince = nil
+            self.lastAttitudeTime = nil
         }
         send(.startRequested)
     }
@@ -195,7 +200,13 @@ final class SessionCoordinator {
         headProvider = head
         head.onSample = { [weak self] sample in self?.handle(sample) }
         head.onConnectionChange = { [weak self] connected in
-            self?.send(connected ? .airpodsReconnected : .airpodsDisconnected)
+            guard let self else { return }
+            if !connected {
+                // Synchronously, before the disconnect event invalidates calibration: no fix
+                // handled after the invalidation may course-update from the old frame's yaw.
+                self.trackingQueue.sync { self.lastAttitudeTime = nil }
+            }
+            self.send(connected ? .airpodsReconnected : .airpodsDisconnected)
         }
         do {
             try head.start()
@@ -295,6 +306,7 @@ final class SessionCoordinator {
 
         let attitudeYaw = Frames.attitudeYaw(sample.attitude, cfg: cfg, fallback: lastAttitudeYaw)
         lastAttitudeYaw = attitudeYaw
+        lastAttitudeTime = now
         let yawOffset = calibration.yawOffset
         let rotation = Frames.listenerRotation(attitude: sample.attitude, yawOffset: yawOffset, cfg: cfg)
 
@@ -325,7 +337,9 @@ final class SessionCoordinator {
             Log.info(String(format: "Origin seeded; ghost at E %.1f N %.1f U %.1f", enu.x, enu.y, enu.z))
         }
 
-        if case .seededCoarse = calibration.updateWithCourse(fix: fix, attitudeYawNow: lastAttitudeYaw) {
+        if case .seededCoarse(_)? = Self.courseUpdate(calibration: calibration, fix: fix,
+                                                   attitudeYaw: lastAttitudeYaw,
+                                                   attitudeTime: lastAttitudeTime, now: AppClock.now) {
             send(.calibrationBecameValid(.coarse))
         }
 
@@ -336,6 +350,23 @@ final class SessionCoordinator {
             send(.gpsRecovered)
         }
         send(.firstFixAccepted)     // no-ops in every state but `.acquiringFix`
+    }
+
+    /// Course-based correction/seeding, but only from an attitude yaw that is fresh — a head sample
+    /// within `motionStaleTimeout` — and therefore from the current CoreMotion reference frame.
+    /// GPS keeps delivering fixes while the AirPods are out; seeding `.coarse` from the old frame's
+    /// last yaw would skip the calibration prompt on reconnect with an offset that can be
+    /// arbitrarily wrong (and beyond `courseGateAngle`, so never corrected).
+    ///
+    /// Returns nil when the update was skipped. Fixes skipped after a disconnect add no seed
+    /// distance: `invalidate()` has already cleared the last course fix.
+    static func courseUpdate(calibration: CalibrationService, fix: SmoothedFix,
+                             attitudeYaw: Double, attitudeTime: TimeInterval?,
+                             now: TimeInterval) -> CalibrationService.CourseUpdate? {
+        guard let attitudeTime, now - attitudeTime <= Tuning.current.motionStaleTimeout else {
+            return nil
+        }
+        return calibration.updateWithCourse(fix: fix, attitudeYawNow: attitudeYaw)
     }
 
     /// Two distinct GPS complaints (§8.1), which must not be conflated:
