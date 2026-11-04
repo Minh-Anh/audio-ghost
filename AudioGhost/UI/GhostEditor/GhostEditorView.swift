@@ -18,9 +18,12 @@ struct GhostEditorView: View {
     @State private var probe = LiveLocationProbe()
     @State private var showAdvanced = false
     @State private var pinFollowsMap = false
+    /// Defers audio-file deletion until Save or Cancel (see `AudioEditSession`).
+    @State private var audioEdits: AudioEditSession
 
     init(ghost: Ghost) {
         _ghost = State(initialValue: ghost)
+        _audioEdits = State(initialValue: AudioEditSession(savedFileName: ghost.audioFileName))
     }
 
     var body: some View {
@@ -36,7 +39,10 @@ struct GhostEditorView: View {
                 if app.store.ghosts.contains(where: { $0.id == ghost.id }) {
                     Section {
                         Button("Delete ghost", role: .destructive) {
-                            app.store.delete(ghost)
+                            // Drop this session's imports, then delete the ghost as saved, so
+                            // `delete` removes the file the stored ghost actually references.
+                            audioEdits.discard(in: app.store.audioDirectory)
+                            app.store.delete(app.store.ghosts.first(where: { $0.id == ghost.id }) ?? ghost)
                             dismiss()
                         }
                         .disabled(app.store.isLocked)
@@ -52,6 +58,7 @@ struct GhostEditorView: View {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
                         app.store.upsert(ghost)
+                        audioEdits.commit(keeping: ghost.audioFileName, in: app.store.audioDirectory)
                         dismiss()
                     }
                 }
@@ -73,7 +80,11 @@ struct GhostEditorView: View {
                     centerMap(on: CLLocationCoordinate2D(latitude: ghost.latitude, longitude: ghost.longitude))
                 }
             }
-            .onDisappear { probe.stop() }
+            .onDisappear {
+                probe.stop()
+                // Cancel and swipe-to-dismiss both land here. After Save or Delete this is a no-op.
+                audioEdits.discard(in: app.store.audioDirectory)
+            }
         }
     }
 
@@ -271,10 +282,8 @@ struct GhostEditorView: View {
     private func adopt(importing url: URL) {
         do {
             let imported = try AudioImport.importFile(from: url, into: app.store.audioDirectory)
-            if ghost.hasAudio {
-                let old = app.store.audioDirectory.appendingPathComponent(ghost.audioFileName)
-                try? FileManager.default.removeItem(at: old)
-            }
+            // Nothing is deleted here: the saved ghost may still reference the old file until Save.
+            audioEdits.recordImport(imported.fileName)
             ghost.audioFileName = imported.fileName
             ghost.audioDuration = imported.duration
             ghost.audioNote = imported.note

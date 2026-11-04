@@ -182,6 +182,14 @@ Record the numbers here once measured, with the date.
   - Small visible changes: ear height applies at the next session start; the HUD's fix counters now
     work in desk simulation; CSV note rows `gps stale`/`gps weak`/`gps recovered`/`calibration x` are
     gone because the `state …` rows already record them.
+- **2026-11-04 — editor audio-file deletion follows Save / Cancel.** `GhostEditorView.adopt(importing:)`
+  used to delete the ghost's old audio file as soon as a new one was imported, so Replace → Cancel
+  left the saved ghost pointing at a deleted file (session start failed with `.ghostInvalid`) and
+  orphaned the new .caf. Imports are now only recorded in `Store/AudioEditSession`. Save upserts,
+  then deletes the replaced file and any intermediate imports; Cancel and swipe-to-dismiss (both
+  via the editor's `.onDisappear`) delete every file imported in that editing session and leave
+  the saved file alone. Delete ghost discards the session's imports, then deletes the ghost *as
+  stored*. Pinned by `AudioEditSessionTests` (8 tests, not yet run in the simulator when written).
 
 ## 5. Tuning constants
 

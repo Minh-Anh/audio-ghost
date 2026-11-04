@@ -182,7 +182,6 @@ Found while reviewing the code, and deliberately not changed by the refactor. No
 | Severity | Issue | Where |
 |---|---|---|
 | High | **Walking with the AirPods out can lock in a wrong calibration.** Course seeding keeps running during the disconnect, using the last yaw from the old reference frame. After 15 m it marks calibration `coarse`, so reconnecting skips the prompt. If the offset is more than 60° off, drift correction ignores it, so it stays wrong until you recalibrate. | `SessionCoordinator.handle(_ fix:)` |
-| High | **Replace audio, then Cancel, loses the saved ghost's sound.** The old file is deleted during import, before Save. | `GhostEditorView.adopt(importing:)` |
 | Medium | **GPS banners can get swallowed.** `gpsDegraded` is set while awaiting calibration even though the reducer ignores the event, so the banner never appears once running until a strong fix clears the flag. The same flag makes `accuracyPoor → gpsLost` unreachable. | `SessionCoordinator.checkGPSHealth` |
 | Low | `state` is read on the tracking queue while main writes it, which is an unsynchronised read. | `checkGPSHealth`, `appendLogRow` |
 | Gap | The "recalibrate?" hint is never shown, and it fires on one bad fix rather than sustained error. | `CalibrationService.suggestsRecalibration` |
