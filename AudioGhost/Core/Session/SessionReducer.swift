@@ -2,7 +2,7 @@ import Foundation
 
 // MARK: - State
 
-enum DegradedReason: String, Equatable {
+enum DegradedReason: Equatable {
     case gpsLost, accuracyPoor
 
     var banner: String {
@@ -13,7 +13,7 @@ enum DegradedReason: String, Equatable {
     }
 }
 
-enum PauseReason: String, Equatable {
+enum PauseReason: Equatable {
     case airpodsDisconnected, audioInterruption, routeNotHeadphones, userPaused
 
     var banner: String {
@@ -48,13 +48,6 @@ enum SessionError: Equatable {
             return "The audio engine failed to start (\(m))."
         case .ghostIncomplete:
             return "This ghost needs an audio file and a location before it can play."
-        }
-    }
-
-    var isPermissionProblem: Bool {
-        switch self {
-        case .locationPermission, .motionPermission: return true
-        default: return false
         }
     }
 }
@@ -104,9 +97,8 @@ enum SessionEvent: Equatable {
     case locationPermissionDenied
     case motionPermissionDenied
     case headTrackingUnavailable
-    case firstFixAccepted                 // seeds the ENU origin
+    case firstFixAccepted
     case calibrationBecameValid(CalibrationQuality)
-    case calibrationInvalidated
     case gpsWentStale
     case gpsAccuracyPoor
     case gpsRecovered
@@ -131,76 +123,62 @@ enum SessionEffect: Equatable {
     case startAudio
     case pauseAudio
     case resumeAudio
-    case seedOrigin
     case invalidateCalibration
     case promptCalibration
-    case log(String)
 }
 
 // MARK: - Reducer
 
 /// Pure `reduce(state, event) → (state, [effects])` (spec §8). Every transition in the spec's
 /// table has a unit test; the coordinator does nothing but feed this function and run its effects.
+/// Any (state, event) pair not listed here is deliberately a no-op.
 enum SessionReducer {
 
     static func reduce(_ state: SessionState,
                        _ event: SessionEvent,
                        calibration: CalibrationQuality) -> (SessionState, [SessionEffect]) {
-        // Terminal failures and user stop are handled uniformly first.
-        switch event {
-        case .stopRequested:
-            return (.idle, [.stopServices])
-        case .locationPermissionDenied:
-            return (.failed(.locationPermission), [.stopServices])
-        case .motionPermissionDenied:
-            return (.failed(.motionPermission), [.stopServices])
-        case .headTrackingUnavailable:
-            return (.failed(.noHeadTrackingAirPods), [.stopServices])
-        case .assetLoadFailed(let m):
-            return (.failed(.assetLoad(m)), [.stopServices])
-        case .audioEngineFailed(let m):
-            return (.failed(.audioEngine(m)), [.stopServices])
-        case .ghostInvalid:
-            return (.failed(.ghostIncomplete), [])
-        default:
-            break
-        }
-
         switch (state, event) {
 
+        // Stop and terminal failures, from any state.
+        case (_, .stopRequested):
+            return (.idle, [.stopServices])
+        case (_, .locationPermissionDenied):
+            return (.failed(.locationPermission), [.stopServices])
+        case (_, .motionPermissionDenied):
+            return (.failed(.motionPermission), [.stopServices])
+        case (_, .headTrackingUnavailable):
+            return (.failed(.noHeadTrackingAirPods), [.stopServices])
+        case (_, .assetLoadFailed(let m)):
+            return (.failed(.assetLoad(m)), [.stopServices])
+        case (_, .audioEngineFailed(let m)):
+            return (.failed(.audioEngine(m)), [.stopServices])
+        case (_, .ghostInvalid):
+            return (.failed(.ghostIncomplete), [])
+
+        // Start-up. Audio starts on the first fix even before calibration: an unaligned ghost is
+        // still useful feedback, and course seeding may fix it hands-free.
         case (.idle, .startRequested):
             return (.acquiringFix, [.startServices])
-
         case (.acquiringFix, .firstFixAccepted):
-            // This fix seeds the ENU origin. Audio starts now even before calibration: an
-            // unaligned ghost is still useful feedback, and course seeding may fix it hands-free.
             if calibration == .none {
-                return (.awaitingCalibration, [.seedOrigin, .startAudio, .promptCalibration])
+                return (.awaitingCalibration, [.startAudio, .promptCalibration])
             }
-            return (.running(quality: calibration), [.seedOrigin, .startAudio])
+            return (.running(quality: calibration), [.startAudio])
 
-        case (.awaitingCalibration, .calibrationBecameValid(let q)):
-            return (.running(quality: q), [.log("calibration \(q.rawValue)")])
-
-        case (.running, .calibrationBecameValid(let q)):
+        // Calibration.
+        case (.awaitingCalibration, .calibrationBecameValid(let q)),
+             (.running, .calibrationBecameValid(let q)):
             return (.running(quality: q), [])
 
-        case (.running, .calibrationInvalidated),
-             (.degraded, .calibrationInvalidated):
-            return (.awaitingCalibration, [.promptCalibration])
-
-        // GPS health — audio keeps playing throughout.
-        case (.running, .gpsWentStale):
-            return (.degraded(reason: .gpsLost), [.log("gps stale")])
-        case (.running, .gpsAccuracyPoor):
-            return (.degraded(reason: .accuracyPoor), [.log("gps weak")])
-        case (.degraded, .gpsRecovered):
-            return (.running(quality: calibration), [.log("gps recovered")])
-        case (.degraded(.accuracyPoor), .gpsWentStale):
+        // GPS health — audio keeps playing throughout. While awaiting calibration these are
+        // ignored, because that banner has something more actionable to say.
+        case (.running, .gpsWentStale),
+             (.degraded(.accuracyPoor), .gpsWentStale):
             return (.degraded(reason: .gpsLost), [])
-        case (.awaitingCalibration, .gpsWentStale),
-             (.awaitingCalibration, .gpsAccuracyPoor):
-            return (state, [])                       // not yet calibrated; the banner already says so
+        case (.running, .gpsAccuracyPoor):
+            return (.degraded(reason: .accuracyPoor), [])
+        case (.degraded, .gpsRecovered):
+            return (.running(quality: calibration), [])
 
         // Pauses.
         case (_, .airpodsDisconnected) where state.isActive:

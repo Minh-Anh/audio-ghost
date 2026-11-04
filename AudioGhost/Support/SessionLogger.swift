@@ -33,8 +33,8 @@ final class SessionLogger {
     /// ~30 min at 25 Hz.
     private let capacity: Int
     private var buffer: [LogRecord]
+    /// Next slot to overwrite once the ring is full; the oldest record lives here.
     private var writeIndex = 0
-    private var filled = false
     private let lock = NSLock()
     private var startTime: TimeInterval = 0
 
@@ -43,35 +43,32 @@ final class SessionLogger {
     init(capacity: Int = 45_000) {
         self.capacity = capacity
         buffer = []
-        buffer.reserveCapacity(min(capacity, 4096))
     }
 
     func start() {
-        lock.lock()
-        buffer.removeAll(keepingCapacity: true)
-        writeIndex = 0
-        filled = false
-        startTime = AppClock.now
-        isRecording = true
-        lock.unlock()
+        lock.withLock {
+            buffer.removeAll(keepingCapacity: true)
+            writeIndex = 0
+            startTime = AppClock.now
+            isRecording = true
+        }
     }
 
     func stop() {
-        lock.lock(); isRecording = false; lock.unlock()
+        lock.withLock { isRecording = false }
     }
 
     func append(_ record: LogRecord) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard isRecording else { return }
-        var r = record
-        r.t = AppClock.now - startTime
-        if buffer.count < capacity {
-            buffer.append(r)
-        } else {
-            buffer[writeIndex] = r
-            writeIndex = (writeIndex + 1) % capacity
-            filled = true
+        lock.withLock {
+            guard isRecording else { return }
+            var r = record
+            r.t = AppClock.now - startTime
+            if buffer.count < capacity {
+                buffer.append(r)
+            } else {
+                buffer[writeIndex] = r
+                writeIndex = (writeIndex + 1) % capacity
+            }
         }
     }
 
@@ -84,16 +81,11 @@ final class SessionLogger {
         append(r)
     }
 
-    var count: Int {
-        lock.lock(); defer { lock.unlock() }
-        return buffer.count
-    }
+    var count: Int { lock.withLock { buffer.count } }
 
     /// Records in chronological order.
     func snapshot() -> [LogRecord] {
-        lock.lock(); defer { lock.unlock() }
-        guard filled else { return buffer }
-        return Array(buffer[writeIndex...] + buffer[..<writeIndex])
+        lock.withLock { Array(buffer[writeIndex...] + buffer[..<writeIndex]) }
     }
 
     func csv() -> String {
@@ -115,10 +107,10 @@ final class SessionLogger {
     }
 
     /// Writes the CSV into Documents and returns its URL for the share sheet.
-    func exportCSV(named name: String? = nil) throws -> URL {
+    func exportCSV() throws -> URL {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd-HHmmss"
-        let fileName = name ?? "audioghost-\(formatter.string(from: Date())).csv"
+        let fileName = "audioghost-\(formatter.string(from: Date())).csv"
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
             .appendingPathComponent(fileName)
         try csv().write(to: url, atomically: true, encoding: .utf8)

@@ -14,11 +14,6 @@ enum Geo {
     struct Coordinate: Equatable {
         var latitude: Double   // WGS84 degrees
         var longitude: Double  // WGS84 degrees
-
-        init(latitude: Double, longitude: Double) {
-            self.latitude = latitude
-            self.longitude = longitude
-        }
     }
 
     /// Great-circle distance in meters between two geodetic coordinates (haversine).

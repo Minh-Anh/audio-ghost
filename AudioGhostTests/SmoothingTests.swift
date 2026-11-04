@@ -73,7 +73,7 @@ final class SmoothingTests: XCTestCase {
         let f = ExponentialPositionFilter()
         f.update(rawENU: .zero, accuracy: 5, time: 0)
         f.update(rawENU: SIMD3(19, 0, 0), accuracy: 5, time: 0.1)
-        XCTAssertLessThanOrEqual(simd_length(f.velocity), Tuning.maxFixSpeed + 1e-9)
+        XCTAssertLessThanOrEqual(simd_length(f.velocity), Tuning.current.maxFixSpeed + 1e-9)
     }
 
     // MARK: Dead reckoning (§5.5)
@@ -83,8 +83,6 @@ final class SmoothingTests: XCTestCase {
                               rawENU: .zero,
                               smoothedENU: .zero,
                               velocityENU: SIMD3(1, 0, 0),
-                              horizontalAccuracy: 5,
-                              timestamp: 100,
                               raw: RawFix(coordinate: Geo.Coordinate(latitude: 0, longitude: 0),
                                           horizontalAccuracy: 5, timestamp: 100))
         XCTAssertEqual(fix.predictedENU(at: 100.5).x, 0.5, accuracy: 1e-9)
@@ -94,6 +92,28 @@ final class SmoothingTests: XCTestCase {
     }
 
     // MARK: Rejection pipeline
+
+    func testPipelineReportsThroughItsCallbacks() {
+        let pipeline = FixPipeline()
+        let origin = Geo.Coordinate(latitude: 43.949317, longitude: 4.805528)
+        var accepted = 0
+        var rejections: [FixPipeline.Rejection] = []
+        pipeline.onFix = { _ in accepted += 1 }
+        pipeline.onRejected = { rejections.append($0) }
+
+        pipeline.ingest(RawFix(coordinate: origin, horizontalAccuracy: 5, timestamp: 100), now: 100)
+        pipeline.ingest(RawFix(coordinate: origin, horizontalAccuracy: -1, timestamp: 101), now: 101)
+
+        XCTAssertEqual(accepted, 1)
+        XCTAssertEqual(rejections, [.invalidAccuracy])
+        XCTAssertEqual(pipeline.acceptedCount, 1)
+        XCTAssertEqual(pipeline.rejectedCount, 1)
+
+        pipeline.reset()
+        XCTAssertNil(pipeline.latest)
+        XCTAssertNil(pipeline.origin)
+        XCTAssertEqual(pipeline.acceptedCount, 0)
+    }
 
     func testPipelineRejectsBadAccuracyAndStaleFixes() {
         let pipeline = FixPipeline()
@@ -141,9 +161,8 @@ final class SmoothingTests: XCTestCase {
     // MARK: Near-field clamp (§5.6)
 
     private func engineWithGhost(north: Double) -> SpatialAudioEngine {
-        let engine = SpatialAudioEngine(queue: DispatchQueue(label: "test"))
+        let engine = SpatialAudioEngine()
         engine.setGhostENU(SIMD3(0, north, 0))
-        engine.setFrameConfig(FrameConfig())
         return engine
     }
 
@@ -156,8 +175,8 @@ final class SmoothingTests: XCTestCase {
 
     func testClampEngagesInsideTheFloorAndHoldsDistance() {
         let engine = engineWithGhost(north: 30)
-        _ = engine.updateListener(pose: pose(at: SIMD3(0, 0, 0), accuracy: 5), now: 0)
-        let state = engine.updateListener(pose: pose(at: SIMD3(0, 28, 0), accuracy: 5), now: 1)
+        _ = engine.updateListener(pose: pose(at: SIMD3(0, 0, 0), accuracy: 5), now: 0, frameConfig: FrameConfig())
+        let state = engine.updateListener(pose: pose(at: SIMD3(0, 28, 0), accuracy: 5), now: 1, frameConfig: FrameConfig())
         XCTAssertTrue(state.clampActive, "2 m away with 5 m accuracy must clamp")
         XCTAssertEqual(state.trueDistance, 2, accuracy: 1e-6)
         XCTAssertEqual(state.renderedDistance, 5, accuracy: 1e-6, "held at max(floor, accuracy)")
@@ -165,28 +184,28 @@ final class SmoothingTests: XCTestCase {
 
     func testClampRadiusFollowsGpsAccuracy() {
         let engine = engineWithGhost(north: 30)
-        _ = engine.updateListener(pose: pose(at: .zero, accuracy: 20), now: 0)
-        let state = engine.updateListener(pose: pose(at: SIMD3(0, 25, 0), accuracy: 20), now: 1)
+        _ = engine.updateListener(pose: pose(at: .zero, accuracy: 20), now: 0, frameConfig: FrameConfig())
+        let state = engine.updateListener(pose: pose(at: SIMD3(0, 25, 0), accuracy: 20), now: 1, frameConfig: FrameConfig())
         XCTAssertTrue(state.clampActive, "5 m away with 20 m accuracy is inside the noise")
         XCTAssertEqual(state.renderedDistance, 20, accuracy: 1e-6)
     }
 
     func testClampHysteresisPreventsBoundaryFlapping() {
         let engine = engineWithGhost(north: 30)
-        _ = engine.updateListener(pose: pose(at: .zero, accuracy: 2), now: 0)
+        _ = engine.updateListener(pose: pose(at: .zero, accuracy: 2), now: 0, frameConfig: FrameConfig())
         // Inside the 4 m floor → clamped.
-        XCTAssertTrue(engine.updateListener(pose: pose(at: SIMD3(0, 27, 0), accuracy: 2), now: 1).clampActive)
+        XCTAssertTrue(engine.updateListener(pose: pose(at: SIMD3(0, 27, 0), accuracy: 2), now: 1, frameConfig: FrameConfig()).clampActive)
         // 4.4 m out: past the floor but inside floor × 1.25 → must stay clamped.
-        XCTAssertTrue(engine.updateListener(pose: pose(at: SIMD3(0, 25.6, 0), accuracy: 2), now: 2).clampActive)
+        XCTAssertTrue(engine.updateListener(pose: pose(at: SIMD3(0, 25.6, 0), accuracy: 2), now: 2, frameConfig: FrameConfig()).clampActive)
         // 5.5 m out: past the exit threshold → releases.
-        XCTAssertFalse(engine.updateListener(pose: pose(at: SIMD3(0, 24.5, 0), accuracy: 2), now: 3).clampActive)
+        XCTAssertFalse(engine.updateListener(pose: pose(at: SIMD3(0, 24.5, 0), accuracy: 2), now: 3, frameConfig: FrameConfig()).clampActive)
     }
 
     func testClampKeepsTrueHeight() {
-        let engine = SpatialAudioEngine(queue: DispatchQueue(label: "test"))
+        let engine = SpatialAudioEngine()
         engine.setGhostENU(SIMD3(0, 0, 8))            // directly overhead, 8 m up
-        _ = engine.updateListener(pose: pose(at: .zero, accuracy: 5), now: 0)
-        let state = engine.updateListener(pose: pose(at: .zero, accuracy: 5), now: 1)
+        _ = engine.updateListener(pose: pose(at: .zero, accuracy: 5), now: 0, frameConfig: FrameConfig())
+        let state = engine.updateListener(pose: pose(at: .zero, accuracy: 5), now: 1, frameConfig: FrameConfig())
         XCTAssertTrue(state.clampActive)
         XCTAssertEqual(state.elevation, 8, accuracy: 1e-9, "height must survive the clamp")
     }
@@ -195,12 +214,12 @@ final class SmoothingTests: XCTestCase {
     /// crosses the ±π seam has to be approached the short way (10°), never the long way round
     /// through north (350°).
     func testClampBearingFilterIsWrapAware() {
-        let engine = SpatialAudioEngine(queue: DispatchQueue(label: "test"))
+        let engine = SpatialAudioEngine()
         engine.setGhostENU(.zero)
 
         // Listener 1 m north of the ghost ⇒ the ghost bears due south (±180°). Inside the 4 m
         // floor, so the clamp is engaged throughout.
-        var state = engine.updateListener(pose: pose(at: SIMD3(0, 1, 0), accuracy: 5), now: 0)
+        var state = engine.updateListener(pose: pose(at: SIMD3(0, 1, 0), accuracy: 5), now: 0, frameConfig: FrameConfig())
         XCTAssertTrue(state.clampActive)
         XCTAssertEqual(abs(state.renderedBearing), .pi, accuracy: 1e-9, "first tick seeds the truth")
 
@@ -211,7 +230,7 @@ final class SmoothingTests: XCTestCase {
         var bearings: [Double] = []
         for i in 1...40 {
             state = engine.updateListener(pose: pose(at: SIMD3(-0.176, 1, 0), accuracy: 5),
-                                          now: Double(i))
+                                          now: Double(i), frameConfig: FrameConfig())
             bearings.append(state.renderedBearing)
         }
         for b in bearings {
@@ -223,8 +242,8 @@ final class SmoothingTests: XCTestCase {
 
     func testNoClampOutsideTheFloor() {
         let engine = engineWithGhost(north: 100)
-        _ = engine.updateListener(pose: pose(at: .zero, accuracy: 5), now: 0)
-        let state = engine.updateListener(pose: pose(at: .zero, accuracy: 5), now: 1)
+        _ = engine.updateListener(pose: pose(at: .zero, accuracy: 5), now: 0, frameConfig: FrameConfig())
+        let state = engine.updateListener(pose: pose(at: .zero, accuracy: 5), now: 1, frameConfig: FrameConfig())
         XCTAssertFalse(state.clampActive)
         XCTAssertEqual(state.renderedDistance, 100, accuracy: 1e-9)
         XCTAssertEqual(state.bearing, 0, accuracy: 1e-9, "due north")

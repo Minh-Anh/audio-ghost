@@ -9,14 +9,12 @@ struct DebugSimulationView: View {
         @Bindable var debug = app.debug
         return Form {
             Section("GPS") {
-                Picker("Scripted path", selection: Binding(
-                    get: { debug.scriptedPath },
-                    set: { debug.scriptedPath = $0 })) {
-                        Text("Real GPS").tag(ScriptedLocationProvider.Path?.none)
-                        ForEach(ScriptedLocationProvider.Path.allCases) { path in
-                            Text(path.title).tag(ScriptedLocationProvider.Path?.some(path))
-                        }
+                Picker("Scripted path", selection: $debug.scriptedPath) {
+                    Text("Real GPS").tag(ScriptedLocationProvider.Path?.none)
+                    ForEach(ScriptedLocationProvider.Path.allCases) { path in
+                        Text(path.title).tag(ScriptedLocationProvider.Path?.some(path))
                     }
+                }
                 VStack(alignment: .leading) {
                     Text(String(format: "Noise σ %.1f m", debug.scriptedNoiseSigma)).font(.footnote)
                     Slider(value: $debug.scriptedNoiseSigma, in: 0...15, step: 0.5)

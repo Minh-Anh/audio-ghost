@@ -26,17 +26,10 @@ final class ScriptedLocationProvider: LocationProviding {
         }
     }
 
-    var onFix: ((SmoothedFix) -> Void)?
-    var onRejectedFix: ((RawFix, String) -> Void)?
-    var authorization: LocationAuthorization { .authorized }
-    var latest: SmoothedFix? { pipeline.latest }
-
     /// Standard deviation of the injected horizontal noise, meters.
     var noiseSigma: Double = 4
     /// Reported accuracy, meters.
     var reportedAccuracy: Double = 8
-    /// Playback speed multiplier.
-    var rate: Double = 1
 
     private let ghost: Geo.Coordinate
     private let path: Path
@@ -44,9 +37,8 @@ final class ScriptedLocationProvider: LocationProviding {
     private let pipeline: FixPipeline
     private var timer: DispatchSourceTimer?
     private var startTime: TimeInterval = 0
-    private var rng = SystemRandomNumberGenerator()
 
-    init(ghost: Geo.Coordinate, path: Path, queue: DispatchQueue, pipeline: FixPipeline = FixPipeline()) {
+    init(ghost: Geo.Coordinate, path: Path, queue: DispatchQueue, pipeline: FixPipeline) {
         self.ghost = ghost
         self.path = path
         self.queue = queue
@@ -68,12 +60,10 @@ final class ScriptedLocationProvider: LocationProviding {
         timer = nil
     }
 
-    func resetOrigin() { pipeline.reset() }
-
     // MARK: Path evaluation
 
     /// Listener position in ENU meters relative to the ghost, at elapsed time `t`.
-    func listenerOffset(at t: Double) -> SIMD3<Double> {
+    private func listenerOffset(at t: Double) -> SIMD3<Double> {
         switch path {
         case .approach100, .gpsDropout:
             let d = max(3, 100 - 1.4 * t)
@@ -92,12 +82,10 @@ final class ScriptedLocationProvider: LocationProviding {
 
     private func tick() {
         let now = AppClock.now
-        let t = (now - startTime) * rate
+        let t = now - startTime
 
-        if path == .gpsDropout {
-            // 12 s of nothing, then a fix that lands 40 m away — exercises the teleport counter.
-            if t > 30, t < 42 { return }
-        }
+        // 12 s of nothing, then a fix that lands 40 m away — exercises the teleport counter.
+        if path == .gpsDropout, t > 30, t < 42 { return }
 
         var offset = listenerOffset(at: t)
         if path == .gpsDropout, t >= 42, t < 45 {
@@ -106,34 +94,28 @@ final class ScriptedLocationProvider: LocationProviding {
         offset.x += gaussian() * noiseSigma
         offset.y += gaussian() * noiseSigma
 
-        let coordinate = Geo.coordinate(fromENU: offset, origin: ghost)
-        let previous = listenerOffset(at: max(0, t - 1))
-        let velocity = listenerOffset(at: t) - previous
+        let velocity = listenerOffset(at: t) - listenerOffset(at: max(0, t - 1))
         let speed = Geo.horizontalLength(velocity)
+        let isMoving = speed > 0.05
         var course = -1.0
-        if speed > 0.05 {
+        if isMoving {
             course = atan2Bearing(east: velocity.x, north: velocity.y).degrees
             if course < 0 { course += 360 }              // CoreLocation reports [0, 360)
         }
 
-        let fix = RawFix(coordinate: coordinate,
-                         horizontalAccuracy: reportedAccuracy,
-                         speed: speed,
-                         course: course,
-                         courseAccuracy: speed > 0.05 ? 10 : -1,
-                         timestamp: now)
-
-        switch pipeline.ingest(fix, now: now) {
-        case .success(let smoothed): onFix?(smoothed)
-        case .failure(let r):
-            let reason = r.reason
-            DispatchQueue.main.async { [weak self] in self?.onRejectedFix?(fix, reason) }
-        }
+        pipeline.ingest(RawFix(coordinate: Geo.coordinate(fromENU: offset, origin: ghost),
+                               horizontalAccuracy: reportedAccuracy,
+                               speed: speed,
+                               course: course,
+                               courseAccuracy: isMoving ? 10 : -1,
+                               timestamp: now),
+                        now: now)
     }
 
+    /// Box–Muller standard normal.
     private func gaussian() -> Double {
-        let u1 = Double.random(in: 1e-9...1, using: &rng)
-        let u2 = Double.random(in: 0...1, using: &rng)
+        let u1 = Double.random(in: 1e-9...1)
+        let u2 = Double.random(in: 0...1)
         return (-2 * log(u1)).squareRoot() * cos(2 * .pi * u2)
     }
 }

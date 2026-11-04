@@ -17,16 +17,16 @@ final class ReducerTests: XCTestCase {
         XCTAssertEqual(effects, [.startServices])
     }
 
-    func testFirstFixSeedsOriginAndStartsAudioAwaitingCalibration() {
+    func testFirstFixStartsAudioAwaitingCalibration() {
         let (state, effects) = reduce(.acquiringFix, .firstFixAccepted)
         XCTAssertEqual(state, .awaitingCalibration)
-        XCTAssertEqual(effects, [.seedOrigin, .startAudio, .promptCalibration])
+        XCTAssertEqual(effects, [.startAudio, .promptCalibration])
     }
 
     func testFirstFixWithExistingCalibrationRunsImmediately() {
         let (state, effects) = reduce(.acquiringFix, .firstFixAccepted, calibration: .precise)
         XCTAssertEqual(state, .running(quality: .precise))
-        XCTAssertEqual(effects, [.seedOrigin, .startAudio])
+        XCTAssertEqual(effects, [.startAudio])
     }
 
     func testRitualSuccessStartsRunningPrecise() {
@@ -131,12 +131,6 @@ final class ReducerTests: XCTestCase {
         let (state, _) = reduce(.paused(reason: .airpodsDisconnected), .routeReturnedToHeadphones,
                                 calibration: .precise)
         XCTAssertEqual(state, .paused(reason: .airpodsDisconnected))
-    }
-
-    func testCalibrationInvalidationSendsRunningBackToAwaiting() {
-        let (state, effects) = reduce(.running(quality: .precise), .calibrationInvalidated)
-        XCTAssertEqual(state, .awaitingCalibration)
-        XCTAssertEqual(effects, [.promptCalibration])
     }
 
     // MARK: Failures

@@ -12,8 +12,6 @@ struct ListenerPose {
     var horizontalAccuracy: Double
     /// Uptime of the last headphone-motion sample.
     var motionTimestamp: TimeInterval
-    /// Uptime of the last accepted fix.
-    var locationTimestamp: TimeInterval
 
     /// Diagnostics carried alongside the pose for the HUD and the CSV.
     var attitudeYaw: Double = 0
@@ -21,8 +19,7 @@ struct ListenerPose {
     var pitch: Double = 0
 
     static let identity = ListenerPose(enuPosition: .zero,
-                                       headOrientationPHASE: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
+                                       headOrientationPHASE: .identityRotation,
                                        horizontalAccuracy: 0,
-                                       motionTimestamp: 0,
-                                       locationTimestamp: 0)
+                                       motionTimestamp: 0)
 }

@@ -92,7 +92,7 @@ struct SessionScreenView: View {
             HStack(spacing: 10) {
                 Chip(icon: "location.fill",
                      text: s.horizontalAccuracy > 0 ? "±\(Int(s.horizontalAccuracy)) m" : "no fix",
-                     ok: s.horizontalAccuracy > 0 && s.horizontalAccuracy <= 15)
+                     ok: s.horizontalAccuracy > 0 && s.horizontalAccuracy <= Tuning.current.weakAccuracy)
                 Chip(icon: "airpodspro",
                      text: s.headphonesConnected ? "AirPods" : "no AirPods",
                      ok: s.headphonesConnected)
@@ -117,7 +117,7 @@ struct SessionScreenView: View {
 
     private var controls: some View {
         VStack(spacing: 12) {
-            if case .paused(let reason) = session.state, reason == .userPaused {
+            if session.state == .paused(reason: .userPaused) {
                 Button {
                     session.resumeByUser()
                 } label: {

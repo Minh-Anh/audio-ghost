@@ -4,37 +4,28 @@ import simd
 
 enum LocationAuthorization: Equatable {
     case notDetermined, denied, restricted, authorized
-}
 
-enum LocationError: LocalizedError {
-    case permissionDenied
-    case servicesDisabled
-
-    var errorDescription: String? {
-        switch self {
-        case .permissionDenied: return "Location permission is required to place sounds in the world."
-        case .servicesDisabled: return "Location Services are turned off."
+    init(_ status: CLAuthorizationStatus) {
+        switch status {
+        case .authorizedAlways, .authorizedWhenInUse: self = .authorized
+        case .denied: self = .denied
+        case .restricted: self = .restricted
+        default: self = .notDetermined
         }
     }
 }
 
-/// Test seam (spec §3.2). `ScriptedLocationProvider` and `ReplayLocationProvider` conform too.
-protocol LocationProviding: AnyObject {
-    /// Thread-safe snapshot of the newest accepted, smoothed fix.
-    var latest: SmoothedFix? { get }
-    /// Delivered on the tracking queue.
-    var onFix: ((SmoothedFix) -> Void)? { get set }
-    /// Delivered on the main queue; raw fixes that were rejected, for HUD starvation stats.
-    var onRejectedFix: ((RawFix, String) -> Void)? { get set }
-    var authorization: LocationAuthorization { get }
-    func start() async throws
-    func stop()
-    /// Forgets the ENU origin and filter state; the next accepted fix seeds a new origin.
-    func resetOrigin()
+enum LocationError: Error {
+    case permissionDenied
 }
 
-/// Heading is a separate seam because it is only ever used inside the calibration ritual —
-/// a pocketed compass is garbage and `startUpdatingHeading` is power-hungry (spec §6.3).
+/// Test seam (spec §3.2): anything that pushes raw fixes into the `FixPipeline` it was given.
+/// `LocationService`, `ScriptedLocationProvider` and `ReplayLocationProvider` all conform.
+protocol LocationProviding: AnyObject {
+    func start() async throws
+    func stop()
+}
+
 /// One compass reading, as the calibration ritual sees it.
 struct HeadingSample: Equatable {
     /// Radians clockwise from TRUE north. Meaningless unless `isTrueHeadingValid`.
@@ -47,7 +38,10 @@ struct HeadingSample: Equatable {
     var isTrueHeadingValid: Bool
 }
 
+/// Heading is a separate seam because it is only ever used inside the calibration ritual —
+/// a pocketed compass is garbage and `startUpdatingHeading` is power-hungry (spec §6.3).
 protocol HeadingProviding: AnyObject {
+    /// Delivered on the main queue.
     var onHeading: ((HeadingSample) -> Void)? { get set }
     /// False on a device with no magnetometer — the ritual is impossible and must say so.
     var isHeadingAvailable: Bool { get }
@@ -55,36 +49,18 @@ protocol HeadingProviding: AnyObject {
     func stopHeading()
 }
 
-/// CoreLocation wrapper: permissions, background updates, outlier rejection, smoothing (§5.3).
+/// CoreLocation wrapper: permissions, background updates, and the hop onto the tracking queue.
 final class LocationService: NSObject, LocationProviding, HeadingProviding {
 
-    // MARK: Seams
-
-    var onFix: ((SmoothedFix) -> Void)?
-    var onRejectedFix: ((RawFix, String) -> Void)?
     var onHeading: ((HeadingSample) -> Void)?
-
-    // MARK: State
 
     private let manager = CLLocationManager()
     private let queue: DispatchQueue
     private let pipeline: FixPipeline
     private var authContinuation: CheckedContinuation<Void, Error>?
-    private var isRunning = false
 
-    var rejectedCount: Int { pipeline.rejectedCount }
-    var acceptedCount: Int { pipeline.acceptedCount }
-
-    var latest: SmoothedFix? { pipeline.latest }
-
-    var authorization: LocationAuthorization {
-        switch manager.authorizationStatus {
-        case .notDetermined: return .notDetermined
-        case .denied: return .denied
-        case .restricted: return .restricted
-        case .authorizedAlways, .authorizedWhenInUse: return .authorized
-        @unknown default: return .notDetermined
-        }
+    private var authorization: LocationAuthorization {
+        LocationAuthorization(manager.authorizationStatus)
     }
 
     init(queue: DispatchQueue, pipeline: FixPipeline = FixPipeline()) {
@@ -95,49 +71,39 @@ final class LocationService: NSObject, LocationProviding, HeadingProviding {
         manager.desiredAccuracy = kCLLocationAccuracyBestForNavigation
         manager.activityType = .fitness
         manager.pausesLocationUpdatesAutomatically = false
-        manager.headingOrientation = .portrait
     }
 
     // MARK: Lifecycle
 
     func start() async throws {
         switch authorization {
-        case .denied: throw LocationError.permissionDenied
-        case .restricted: throw LocationError.permissionDenied
+        case .denied, .restricted:
+            throw LocationError.permissionDenied
         case .notDetermined:
             try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
                 authContinuation = c
                 manager.requestWhenInUseAuthorization()
             }
-        case .authorized: break
+        case .authorized:
+            break
         }
         guard authorization == .authorized else { throw LocationError.permissionDenied }
 
         // Only legal once authorized; requires the `location` background mode (Info.plist).
         manager.allowsBackgroundLocationUpdates = true
         manager.showsBackgroundLocationIndicator = true
-        isRunning = true
         manager.startUpdatingLocation()
         Log.info("LocationService started")
     }
 
     func stop() {
-        isRunning = false
         manager.stopUpdatingLocation()
         manager.stopUpdatingHeading()
         manager.allowsBackgroundLocationUpdates = false
     }
 
-    func resetOrigin() {
-        pipeline.reset()
-    }
-
-    /// Current session origin, if one has been seeded.
-    var sessionOrigin: Geo.Coordinate? { pipeline.origin }
-
     // MARK: Heading (calibration ritual only)
 
-    /// True when the device has a usable magnetometer.
     var isHeadingAvailable: Bool { CLLocationManager.headingAvailable() }
 
     /// Exposed for the regression test on `headingFilter` below.
@@ -165,22 +131,23 @@ extension LocationService: CLLocationManagerDelegate {
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         guard let c = authContinuation, manager.authorizationStatus != .notDetermined else { return }
         authContinuation = nil
-        switch manager.authorizationStatus {
-        case .authorizedAlways, .authorizedWhenInUse: c.resume()
-        default: c.resume(throwing: LocationError.permissionDenied)
+        if authorization == .authorized {
+            c.resume()
+        } else {
+            c.resume(throwing: LocationError.permissionDenied)
         }
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
         guard let location = locations.last else { return }
         let fix = RawFix(coordinate: Geo.Coordinate(latitude: location.coordinate.latitude,
-                                                   longitude: location.coordinate.longitude),
+                                                    longitude: location.coordinate.longitude),
                          horizontalAccuracy: location.horizontalAccuracy,
                          speed: location.speed,
                          course: location.course,
                          courseAccuracy: location.courseAccuracy,
                          timestamp: AppClock.uptime(for: location.timestamp))
-        queue.async { [weak self] in self?.ingest(fix) }
+        queue.async { [pipeline] in pipeline.ingest(fix) }
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
@@ -197,21 +164,5 @@ extension LocationService: CLLocationManagerDelegate {
 
     func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
         Log.error("CoreLocation error: \(error.localizedDescription)")
-    }
-}
-
-// MARK: - Ingestion (tracking queue)
-
-extension LocationService {
-
-    /// Runs on the tracking queue.
-    func ingest(_ fix: RawFix) {
-        switch pipeline.ingest(fix) {
-        case .success(let smoothed):
-            onFix?(smoothed)
-        case .failure(let rejection):
-            let reason = rejection.reason
-            DispatchQueue.main.async { [weak self] in self?.onRejectedFix?(fix, reason) }
-        }
     }
 }

@@ -46,69 +46,53 @@ enum CalibrationError: LocalizedError, Equatable {
 /// and is invalidated on AirPods reconnect (the CoreMotion reference frame's horizontal axes are
 /// re-randomised). Two ways to (re)acquire it: the compass ritual (precise) and GPS course
 /// (coarse, hands-free, also used as slow drift correction while walking).
+///
+/// Thread-safe: the tracking queue applies course updates and the main queue applies the ritual.
 final class CalibrationService {
 
-    // MARK: Observable-ish state (guarded)
+    /// Minimum samples of each kind the ritual solver needs.
+    static let minimumRitualSamples = 5
 
     private let lock = NSLock()
-    private var _yawOffset: Double = 0
-    private var _quality: CalibrationQuality = .none
-    private var _calibratedAt: TimeInterval?
-    private var _lastCourseError: Double?
-    private var _courseDistanceWalked: Double = 0
-    private var _lastCourseFixENU: SIMD3<Double>?
+    private var offset: Double = 0
+    private var currentQuality: CalibrationQuality = .none
+    private var calibratedAt: TimeInterval?
+    private var courseError: Double?
+    private var courseDistanceWalked: Double = 0
+    private var lastCourseFixENU: SIMD3<Double>?
 
-    var yawOffset: Double? {
-        lock.lock(); defer { lock.unlock() }
-        return _quality == .none ? nil : _yawOffset
-    }
+    /// The offset to render with. Stays at its last value when invalidated and is 0 before the
+    /// first calibration: audio still plays, just unaligned. Check `isValid` before trusting it.
+    var yawOffset: Double { lock.withLock { offset } }
 
-    /// Offset to apply for rendering: 0 while uncalibrated (audio still plays, just unaligned).
-    var renderingYawOffset: Double {
-        lock.lock(); defer { lock.unlock() }
-        return _yawOffset
-    }
-
-    var quality: CalibrationQuality {
-        lock.lock(); defer { lock.unlock() }
-        return _quality
-    }
+    var quality: CalibrationQuality { lock.withLock { currentQuality } }
 
     var isValid: Bool { quality != .none }
 
-    var calibratedAt: TimeInterval? {
-        lock.lock(); defer { lock.unlock() }
-        return _calibratedAt
-    }
-
     var ageSeconds: Double? {
-        guard let at = calibratedAt else { return nil }
-        return AppClock.now - at
+        lock.withLock { calibratedAt.map { AppClock.now - $0 } }
     }
 
     /// Most recent course-vs-head disagreement, radians. The HUD's tuning signal for `courseGain`.
-    var lastCourseError: Double? {
-        lock.lock(); defer { lock.unlock() }
-        return _lastCourseError
-    }
+    var lastCourseError: Double? { lock.withLock { courseError } }
 
-    /// True when sustained course error suggests the user should redo the ritual.
+    /// True when the latest course error suggests the user should redo the ritual.
     var suggestsRecalibration: Bool {
         guard let e = lastCourseError else { return false }
-        return abs(e) > Tuning.recalibrateHintError
+        return abs(e) > Tuning.current.recalibrateHintError
     }
 
     // MARK: Invalidation
 
-    /// Called on AirPods reconnect: the reference frame reset, so the offset means nothing.
+    /// Called on AirPods disconnect: the reference frame resets, so the offset means nothing.
     func invalidate() {
-        lock.lock()
-        _quality = .none
-        _calibratedAt = nil
-        _lastCourseError = nil
-        _courseDistanceWalked = 0
-        _lastCourseFixENU = nil
-        lock.unlock()
+        lock.withLock {
+            currentQuality = .none
+            calibratedAt = nil
+            courseError = nil
+            courseDistanceWalked = 0
+            lastCourseFixENU = nil
+        }
         Log.info("Calibration invalidated")
     }
 
@@ -124,15 +108,17 @@ final class CalibrationService {
     static func solveRitual(headings: [Double],
                             headingAccuracies: [Double],
                             attitudeYaws: [Double]) -> Result<Double, CalibrationError> {
-        guard headings.count >= 5, attitudeYaws.count >= 5 else { return .failure(.notEnoughSamples) }
+        guard headings.count >= minimumRitualSamples, attitudeYaws.count >= minimumRitualSamples else {
+            return .failure(.notEnoughSamples)
+        }
         if headingAccuracies.contains(where: { $0 < 0 }) { return .failure(.compassNeedsCalibration) }
-        if let worst = headingAccuracies.max(), worst > Tuning.calibrationMaxHeadingAccuracy {
+        if let worst = headingAccuracies.max(), worst > Tuning.current.calibrationMaxHeadingAccuracy {
             return .failure(.compassInaccurate(worst))
         }
         let headingSpread = circularSpread(headings)
         let attitudeSpread = circularSpread(attitudeYaws)
-        guard headingSpread <= Tuning.calibrationMaxHeadingSpread,
-              attitudeSpread <= Tuning.calibrationMaxAttitudeSpread else {
+        guard headingSpread <= Tuning.current.calibrationMaxHeadingSpread,
+              attitudeSpread <= Tuning.current.calibrationMaxAttitudeSpread else {
             return .failure(.userMoved(headingSpread: headingSpread, attitudeSpread: attitudeSpread))
         }
         guard let headingMean = circularMean(headings),
@@ -143,14 +129,14 @@ final class CalibrationService {
     }
 
     /// Commits a solved ritual offset.
-    func applyPreciseOffset(_ offset: Double) {
-        lock.lock()
-        _yawOffset = wrapToPi(offset)
-        _quality = .precise
-        _calibratedAt = AppClock.now
-        _lastCourseError = nil
-        lock.unlock()
-        Log.info(String(format: "Calibrated (precise): yawOffset = %.1f°", offset.degrees))
+    func applyPreciseOffset(_ newOffset: Double) {
+        lock.withLock {
+            offset = wrapToPi(newOffset)
+            currentQuality = .precise
+            calibratedAt = AppClock.now
+            courseError = nil
+        }
+        Log.info(String(format: "Calibrated (precise): yawOffset = %.1f°", newOffset.degrees))
     }
 
     // MARK: Course-based drift correction & cold start (§6.4)
@@ -168,53 +154,46 @@ final class CalibrationService {
     /// - Parameter attitudeYawNow: the current raw `Frames.attitudeYaw` value.
     @discardableResult
     func updateWithCourse(fix: SmoothedFix, attitudeYawNow: Double) -> CourseUpdate {
-        guard fix.raw.speed > Tuning.courseMinSpeed else {
-            lock.lock(); _lastCourseFixENU = nil; lock.unlock()
-            return .ignoredSlow
-        }
-        guard let course = fix.raw.courseRadians,
-              fix.raw.courseAccuracy >= 0,
-              fix.raw.courseAccuracy < Tuning.maxCourseAccuracy else {
-            return .ignoredCourseAccuracy
-        }
-
-        lock.lock()
-        // Track distance walked with a usable course, for the cold-start seed.
-        if let last = _lastCourseFixENU {
-            _courseDistanceWalked += Geo.horizontalLength(fix.smoothedENU - last)
-        }
-        _lastCourseFixENU = fix.smoothedENU
-
-        if _quality == .none {
-            guard _courseDistanceWalked >= Tuning.coarseSeedDistance else {
-                let walked = _courseDistanceWalked
-                lock.unlock()
-                return .accumulating(walked)
+        let tuning = Tuning.current
+        let update: CourseUpdate = lock.withLock {
+            guard fix.raw.speed > tuning.courseMinSpeed else {
+                lastCourseFixENU = nil
+                return .ignoredSlow
             }
-            _yawOffset = wrapToPi(course - attitudeYawNow)
-            _quality = .coarse
-            _calibratedAt = AppClock.now
-            _lastCourseError = 0
-            let seeded = _yawOffset
-            lock.unlock()
+            guard let course = fix.raw.courseRadians,
+                  fix.raw.courseAccuracy >= 0,
+                  fix.raw.courseAccuracy < tuning.maxCourseAccuracy else {
+                return .ignoredCourseAccuracy
+            }
+
+            // Track distance walked with a usable course, for the cold-start seed.
+            if let last = lastCourseFixENU {
+                courseDistanceWalked += Geo.horizontalLength(fix.smoothedENU - last)
+            }
+            lastCourseFixENU = fix.smoothedENU
+
+            if currentQuality == .none {
+                guard courseDistanceWalked >= tuning.coarseSeedDistance else {
+                    return .accumulating(courseDistanceWalked)
+                }
+                offset = wrapToPi(course - attitudeYawNow)
+                currentQuality = .coarse
+                calibratedAt = AppClock.now
+                courseError = 0
+                return .seededCoarse(offset)
+            }
+
+            let error = wrapToPi(course - wrapToPi(attitudeYawNow + offset))
+            courseError = error
+            guard abs(error) < tuning.courseGateAngle else {
+                return .ignoredHeadTurned(error)    // head turned while walking: don't corrupt the offset
+            }
+            offset = wrapToPi(offset + tuning.courseGain * error)
+            return .corrected(error)
+        }
+        if case .seededCoarse(let seeded) = update {
             Log.info(String(format: "Calibrated (coarse, course seed): yawOffset = %.1f°", seeded.degrees))
-            return .seededCoarse(seeded)
         }
-
-        let trueYaw = wrapToPi(attitudeYawNow + _yawOffset)
-        let err = wrapToPi(course - trueYaw)
-        _lastCourseError = err
-        guard abs(err) < Tuning.courseGateAngle else {
-            lock.unlock()
-            return .ignoredHeadTurned(err)      // head turned while walking: don't corrupt the offset
-        }
-        _yawOffset = wrapToPi(_yawOffset + Tuning.courseGain * err)
-        lock.unlock()
-        return .corrected(err)
-    }
-
-    /// True yaw for a raw attitude yaw, using the current offset.
-    func trueYaw(attitudeYaw: Double) -> Double {
-        wrapToPi(attitudeYaw + renderingYawOffset)
+        return update
     }
 }

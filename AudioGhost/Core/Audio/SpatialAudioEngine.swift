@@ -35,43 +35,37 @@ enum SpatialAudioError: LocalizedError {
 /// it moves the source's rendered transform, never the world model.
 final class SpatialAudioEngine {
 
-    private let queue: DispatchQueue
+    /// The built PHASE graph; all of it exists or none of it does.
+    private struct Graph {
+        let engine: PHASEEngine
+        let listener: PHASEListener
+        let source: PHASESource
+        let mixerID: String
+        let soundAssetID: String
+        let eventAssetID: String
+    }
 
-    private var engine: PHASEEngine?
-    private var listener: PHASEListener?
-    private var source: PHASESource?
+    private var graph: Graph?
     private var event: PHASESoundEvent?
-    private var soundAssetID = ""
-    private var eventAssetID = ""
 
     /// Ghost position in session ENU (x: east, y: north, z: up relative to ear level).
-    private(set) var ghostENU: SIMD3<Double> = .zero
-    private var frameConfig = FrameConfig()
+    private var ghostENU: SIMD3<Double> = .zero
 
     // Near-field clamp state
     private var clampActive = false
     private var smoothedBearing: Double = 0
     private var lastTickTime: TimeInterval?
 
-    private(set) var renderState = RenderState()
-
-    init(queue: DispatchQueue) {
-        self.queue = queue
-    }
-
-    var isRunning: Bool { engine != nil }
-
     // MARK: Setup
 
-    /// Builds the graph and starts the looping event. Tracking queue only.
+    /// Builds the graph and starts the looping event.
     func start(ghost: Ghost, audioURL: URL, ghostENU: SIMD3<Double>, frameConfig: FrameConfig) throws {
         stop()
 
         self.ghostENU = ghostENU
-        self.frameConfig = frameConfig
-        self.smoothedBearing = atan2Bearing(east: ghostENU.x, north: ghostENU.y)
-        self.clampActive = false
-        self.lastTickTime = nil
+        smoothedBearing = atan2Bearing(east: ghostENU.x, north: ghostENU.y)
+        clampActive = false
+        lastTickTime = nil
 
         let engine = PHASEEngine(updateMode: .automatic)
         // Keep the world in meters/seconds so ENU values can be handed over untouched.
@@ -89,12 +83,12 @@ final class SpatialAudioEngine {
         try engine.rootObject.addChild(listener)
 
         let source = PHASESource(engine: engine)
-        source.transform = Quat.transform(rotation: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
+        source.transform = Quat.transform(rotation: .identityRotation,
                                           position: Frames.phasePosition(ghostENU, cfg: frameConfig))
         try engine.rootObject.addChild(source)
 
-        soundAssetID = "asset-\(ghost.id.uuidString)"
-        eventAssetID = "event-\(ghost.id.uuidString)"
+        let soundAssetID = "asset-\(ghost.id.uuidString)"
+        let eventAssetID = "event-\(ghost.id.uuidString)"
 
         do {
             _ = try engine.assetRegistry.registerSoundAsset(
@@ -111,7 +105,6 @@ final class SpatialAudioEngine {
             throw SpatialAudioError.pipelineUnavailable
         }
         let mixer = PHASESpatialMixerDefinition(spatialPipeline: pipeline)
-        mixerIdentifier = mixer.identifier          // needed to rebuild the event after a pause
         let distance = PHASEGeometricSpreadingDistanceModelParameters()
         distance.rolloffFactor = ghost.rolloffFactor
         distance.fadeOutParameters = PHASEDistanceModelFadeOutParameters(cullDistance: ghost.cullDistance)
@@ -131,37 +124,24 @@ final class SpatialAudioEngine {
 
         try engine.start()
 
-        let params = PHASEMixerParameters()
-        params.addSpatialMixerParameters(identifier: mixer.identifier, source: source, listener: listener)
-
+        let graph = Graph(engine: engine, listener: listener, source: source, mixerID: mixer.identifier,
+                          soundAssetID: soundAssetID, eventAssetID: eventAssetID)
+        self.graph = graph
         do {
-            let event = try PHASESoundEvent(engine: engine, assetIdentifier: eventAssetID,
-                                            mixerParameters: params)
-            self.event = event
-            event.start(completion: nil)
+            try startEvent(in: graph)
         } catch {
             throw SpatialAudioError.eventCreation(error.localizedDescription)
         }
-
-        self.engine = engine
-        self.listener = listener
-        self.source = source
-        renderState.isPlaying = true
         Log.info("SpatialAudioEngine started for ghost \(ghost.name)")
     }
 
     func stop() {
-        event?.stopAndInvalidate()
-        event = nil
-        engine?.stop()
-        if let engine {
-            if !soundAssetID.isEmpty { engine.assetRegistry.unregisterAsset(identifier: soundAssetID, completion: nil) }
-            if !eventAssetID.isEmpty { engine.assetRegistry.unregisterAsset(identifier: eventAssetID, completion: nil) }
-        }
-        listener = nil
-        source = nil
-        engine = nil
-        renderState.isPlaying = false
+        pauseEvent()
+        guard let graph else { return }
+        graph.engine.stop()
+        graph.engine.assetRegistry.unregisterAsset(identifier: graph.soundAssetID, completion: nil)
+        graph.engine.assetRegistry.unregisterAsset(identifier: graph.eventAssetID, completion: nil)
+        self.graph = nil
     }
 
     /// Pause: stop the event but keep the engine and registered assets, so resuming is cheap
@@ -169,36 +149,20 @@ final class SpatialAudioEngine {
     func pauseEvent() {
         event?.stopAndInvalidate()
         event = nil
-        renderState.isPlaying = false
     }
 
     /// Recreates and restarts the event after a pause. Returns false if the graph is gone entirely.
     @discardableResult
     func resumeEvent() -> Bool {
-        guard let engine, let source, let listener, event == nil, !eventAssetID.isEmpty else {
-            return event != nil
-        }
-        // An interruption can leave the engine itself stopped once the audio session is torn
-        // down and reactivated, so bring it back before rebuilding the event.
-        if engine.renderingState != .started {
-            do {
-                try engine.start()
-            } catch {
-                Log.error("Failed to restart PHASE engine: \(error.localizedDescription)")
-                return false
-            }
-        }
-        // The mixer identifier is stored in the registered event asset, so rebuild parameters by
-        // re-deriving it from the sound event asset's mixers.
-        guard let mixerID = mixerIdentifier else { return false }
-        let params = PHASEMixerParameters()
-        params.addSpatialMixerParameters(identifier: mixerID, source: source, listener: listener)
+        if event != nil { return true }
+        guard let graph else { return false }
         do {
-            let event = try PHASESoundEvent(engine: engine, assetIdentifier: eventAssetID,
-                                            mixerParameters: params)
-            self.event = event
-            event.start(completion: nil)
-            renderState.isPlaying = true
+            // An interruption can leave the engine itself stopped once the audio session is torn
+            // down and reactivated, so bring it back before rebuilding the event.
+            if graph.engine.renderingState != .started {
+                try graph.engine.start()
+            }
+            try startEvent(in: graph)
             return true
         } catch {
             Log.error("Failed to resume sound event: \(error.localizedDescription)")
@@ -206,14 +170,21 @@ final class SpatialAudioEngine {
         }
     }
 
-    private var mixerIdentifier: String?
+    /// A stopped `PHASESoundEvent` can't be restarted, so every (re)start builds a new one.
+    private func startEvent(in graph: Graph) throws {
+        let params = PHASEMixerParameters()
+        params.addSpatialMixerParameters(identifier: graph.mixerID, source: graph.source, listener: graph.listener)
+        let event = try PHASESoundEvent(engine: graph.engine, assetIdentifier: graph.eventAssetID,
+                                        mixerParameters: params)
+        self.event = event
+        event.start(completion: nil)
+    }
 
     // MARK: Per-tick update
 
     /// Updates the listener transform and — inside the near-field clamp — the source transform.
-    /// Tracking queue only.
-    @discardableResult
-    func updateListener(pose: ListenerPose, now: TimeInterval) -> RenderState {
+    /// Runs before the graph exists too, so the HUD has geometry to show before audio starts.
+    func updateListener(pose: ListenerPose, now: TimeInterval, frameConfig cfg: FrameConfig) -> RenderState {
         let isFirstTick = lastTickTime == nil
         let dt = lastTickTime.map { max(0, now - $0) } ?? 0
         lastTickTime = now
@@ -227,50 +198,38 @@ final class SpatialAudioEngine {
 
         // §5.6 near-field clamp with hysteresis. rMin grows with GPS uncertainty: inside the noise
         // the true geometry is meaningless and would whip the source around the head.
-        let rMin = max(Tuning.nearFieldFloor, pose.horizontalAccuracy)
-        let enterClamp = r < rMin
-        let exitClamp = r > rMin * Tuning.clampExitFactor
-        if clampActive {
-            if exitClamp { clampActive = false }
-        } else if enterClamp {
-            clampActive = true
-        }
+        let rMin = max(Tuning.current.nearFieldFloor, pose.horizontalAccuracy)
+        clampActive = clampActive ? r <= rMin * Tuning.current.clampExitFactor : r < rMin
 
-        var renderRel = rel
+        var renderRel = rel                          // z stays: the true height survives the clamp
         if clampActive {
             smoothedBearing = lowpassAngle(current: smoothedBearing, target: trueBearing,
-                                           tau: Tuning.nearFieldBearingTau, dt: dt)
+                                           tau: Tuning.current.nearFieldBearingTau, dt: dt)
             let dir = bearingToUnitENU(smoothedBearing)
             renderRel.x = rMin * dir.east
             renderRel.y = rMin * dir.north
-            renderRel.z = rel.z                      // keep the true height
         } else {
             smoothedBearing = trueBearing
         }
 
-        let listenerPhase = Frames.phasePosition(pose.enuPosition, cfg: frameConfig)
-        listener?.transform = Quat.transform(rotation: pose.headOrientationPHASE, position: listenerPhase)
+        graph?.listener.transform = Quat.transform(rotation: pose.headOrientationPHASE,
+                                                   position: Frames.phasePosition(pose.enuPosition, cfg: cfg))
 
         // The source transform is static except in the clamp regime — the one documented exception.
-        let sourceENU = clampActive ? (pose.enuPosition + renderRel) : ghostENU
-        source?.transform = Quat.transform(rotation: simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
-                                           position: Frames.phasePosition(sourceENU, cfg: frameConfig))
+        let sourceENU = clampActive ? pose.enuPosition + renderRel : ghostENU
+        graph?.source.transform = Quat.transform(rotation: .identityRotation,
+                                                 position: Frames.phasePosition(sourceENU, cfg: cfg))
 
-        renderState.clampActive = clampActive
-        renderState.trueDistance = simd_length(rel)
-        renderState.renderedDistance = simd_length(renderRel)
-        renderState.bearing = trueBearing
-        renderState.renderedBearing = clampActive ? smoothedBearing : trueBearing
-        renderState.elevation = rel.z
-        return renderState
+        return RenderState(clampActive: clampActive,
+                           trueDistance: simd_length(rel),
+                           renderedDistance: simd_length(renderRel),
+                           bearing: trueBearing,
+                           renderedBearing: clampActive ? smoothedBearing : trueBearing,
+                           elevation: rel.z,
+                           isPlaying: event != nil)
     }
 
-    /// Called when the frame config changes from the Debug HUD (§15 sign flips).
-    func setFrameConfig(_ cfg: FrameConfig) {
-        frameConfig = cfg
-    }
-
-    /// Called when the ghost's rendered ENU position changes (origin re-seed, height edit).
+    /// Called when the ghost's position becomes known (the session's first accepted fix).
     func setGhostENU(_ enu: SIMD3<Double>) {
         ghostENU = enu
     }

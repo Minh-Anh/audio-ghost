@@ -36,19 +36,6 @@ func circularMean(_ angles: [Double]) -> Double? {
     return wrapToPi(atan2(sy, sx))
 }
 
-/// Resultant-vector length of a set of angles: 1 = perfectly concentrated, 0 = uniformly spread.
-func circularConcentration(_ angles: [Double]) -> Double {
-    guard !angles.isEmpty else { return 0 }
-    var sx = 0.0, sy = 0.0
-    for a in angles {
-        sx += cos(a)
-        sy += sin(a)
-    }
-    sx /= Double(angles.count)
-    sy /= Double(angles.count)
-    return (sx * sx + sy * sy).squareRoot()
-}
-
 /// Max angular spread (radians) of a set of angles around their circular mean.
 /// Used by the calibration ritual to reject samples taken while the user moved.
 func circularSpread(_ angles: [Double]) -> Double {

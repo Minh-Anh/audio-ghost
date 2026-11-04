@@ -174,8 +174,6 @@ final class CalibrationFlowModel {
         self.session = session
     }
 
-    /// Minimum concurrent samples the solver needs.
-    private static let minimumHeadings = 5
     /// Hard ceiling on the collection window: the ritual asks the user to stand still, and a slow
     /// or busy compass shouldn't fail them at the 2 s mark if samples are still arriving.
     private static let maximumWait: TimeInterval = 6
@@ -214,14 +212,14 @@ final class CalibrationFlowModel {
             let yaw = session.currentAttitudeYaw
             self.attitudes.append(yaw)
             let elapsed = Date().timeIntervalSince(self.startTime)
-            self.progress = min(1, elapsed / Tuning.calibrationSampleDuration)
-            let enoughHeadings = self.headings.count >= Self.minimumHeadings
+            self.progress = min(1, elapsed / Tuning.current.calibrationSampleDuration)
+            let enoughHeadings = self.headings.count >= CalibrationService.minimumRitualSamples
             self.liveReadout = String(format: "compass %d · head yaw %.0f°",
                                       self.headings.count, yaw.degrees)
-            self.waitingForCompass = elapsed >= Tuning.calibrationSampleDuration && !enoughHeadings
+            self.waitingForCompass = elapsed >= Tuning.current.calibrationSampleDuration && !enoughHeadings
 
             // Finish on time if the compass kept up; otherwise keep collecting until the ceiling.
-            if elapsed >= Tuning.calibrationSampleDuration, enoughHeadings || elapsed >= Self.maximumWait {
+            if elapsed >= Tuning.current.calibrationSampleDuration, enoughHeadings || elapsed >= Self.maximumWait {
                 self.finish()
             }
         }
@@ -235,10 +233,7 @@ final class CalibrationFlowModel {
     }
 
     private func finish() {
-        timer?.invalidate()
-        timer = nil
-        session?.headingProvider?.stopHeading()
-        session?.headingProvider?.onHeading = nil
+        cancel()
 
         // The compass was reporting, but never with a usable true heading: that is a missing GPS
         // fix, not a shaky hand, and telling the user to "hold still" would send them in circles.

@@ -4,14 +4,9 @@ import simd
 /// The §6.1 FrameProbe: ten minutes of measurement that eliminates the entire class of
 /// "which axis is forward" bugs.
 ///
-/// Rather than only *displaying* numbers for a human to transcribe, this screen solves for the
-/// sensor frame directly and writes it into `FrameConfig`:
-///   * `headUpLocal`  = −(mean gravity) with the head level — gravity is unambiguous.
-///   * `headRightLocal` = −(rotation axis of the "nod down" move), because a downward nod is a
-///     negative rotation about the ear-to-ear axis under the right-hand rule.
-///   * `headForwardLocal` = up × right.
-///   * `referenceUpSign` = sign of the reference-frame z component of the level head's up vector.
-/// The turn-right step is then used as an independent check that derived yaw increases clockwise.
+/// Rather than only *displaying* numbers for a human to transcribe, this screen captures averaged
+/// poses, solves for the sensor frame (`Frames.solveSensorFrame`) and writes it into `FrameConfig`.
+/// The turn-right and roll steps are independent checks on the result.
 struct FrameProbeView: View {
     @Environment(AppEnvironment.self) private var app
     @Environment(\.dismiss) private var dismiss
@@ -85,7 +80,7 @@ struct FrameProbeView: View {
         }
     }
 
-    private func resultBlock(_ result: FrameProbeModel.Result) -> some View {
+    private func resultBlock(_ result: FrameProbeModel.Outcome) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text("RESULT").font(.system(size: 10, weight: .bold, design: .monospaced))
                 .foregroundStyle(.tertiary)
@@ -131,7 +126,7 @@ final class FrameProbeModel {
         var gravity: SIMD3<Double>
     }
 
-    struct Result {
+    struct Outcome {
         var text: String
         var warning: String?
     }
@@ -140,7 +135,7 @@ final class FrameProbeModel {
     private(set) var activeStep: Step?
     private(set) var countdown = 3
     private(set) var liveText = "waiting for samples…"
-    private(set) var result: Result?
+    private(set) var result: Outcome?
     private(set) var isConnected = false
 
     private var provider: HeadPoseProviding?
@@ -213,6 +208,7 @@ final class FrameProbeModel {
         let q = sample.rawAttitude
         let cfg = frames?.config ?? FrameConfig()
         let yaw = Frames.attitudeYaw(q, cfg: cfg, fallback: 0)
+        let x = q.act(SIMD3(1, 0, 0)), y = q.act(SIMD3(0, 1, 0)), z = q.act(SIMD3(0, 0, 1))
         liveText = String(
             format: """
             q  w %+.3f  x %+.3f  y %+.3f  z %+.3f
@@ -224,9 +220,9 @@ final class FrameProbeModel {
             """,
             q.real, q.imag.x, q.imag.y, q.imag.z,
             sample.gravity.x, sample.gravity.y, sample.gravity.z,
-            q.act(SIMD3(1, 0, 0)).x, q.act(SIMD3(1, 0, 0)).y, q.act(SIMD3(1, 0, 0)).z,
-            q.act(SIMD3(0, 1, 0)).x, q.act(SIMD3(0, 1, 0)).y, q.act(SIMD3(0, 1, 0)).z,
-            q.act(SIMD3(0, 0, 1)).x, q.act(SIMD3(0, 0, 1)).y, q.act(SIMD3(0, 0, 1)).z,
+            x.x, x.y, x.z,
+            y.x, y.y, y.z,
+            z.x, z.y, z.z,
             yaw.degrees, Frames.attitudePitch(q, cfg: cfg).degrees)
     }
 
@@ -235,31 +231,19 @@ final class FrameProbeModel {
     func solveAndSave() {
         guard let level = captured[.level], let nod = captured[.nodDown], let frames else { return }
 
-        // Up: gravity points down in the sensor frame, so the top of the head is its negation.
-        let up = simd_normalize(-level.gravity)
-
-        // Right: a downward nod is a NEGATIVE rotation about the ear-to-ear axis (right-hand rule
-        // with forward × up = right), so negate the measured axis.
-        let deltaLocal = (level.attitude.inverse * nod.attitude).normalized
-        guard var right = Quat.axis(of: deltaLocal) else {
-            result = Result(text: "The nod step didn't move enough to find an axis.",
-                            warning: "Redo step 3 with a clear 45° nod.")
+        guard let solved = Frames.solveSensorFrame(levelAttitude: level.attitude,
+                                                   levelGravity: level.gravity,
+                                                   nodDownAttitude: nod.attitude) else {
+            result = Outcome(text: "The nod step didn't move enough to find an axis.",
+                             warning: "Redo step 3 with a clear 45° nod.")
             return
         }
-        right = -right
-        // Orthogonalize against up, then forward = up × right.
-        right = simd_normalize(right - up * simd_dot(right, up))
-        let forward = simd_normalize(simd_cross(up, right))
-
-        // Reference vertical sign: with a level head, the top of the head must map onto the
-        // reference frame's vertical.
-        let upInReference = level.attitude.act(up)
-        let referenceUpSign: Double = upInReference.z >= 0 ? 1 : -1
+        let (forward, up, right) = (solved.forward, solved.up, solved.right)
 
         var cfg = frames.observed
         cfg.headForwardLocal = forward
         cfg.headUpLocal = up
-        cfg.referenceUpSign = referenceUpSign
+        cfg.referenceUpSign = solved.referenceUpSign
         cfg.probedAt = Date()
 
         // Independent check: turning the head right must increase the compass-convention yaw.
@@ -291,7 +275,7 @@ final class FrameProbeModel {
         cfg.probeNotes = "\(turnText); \(rollText)"
         frames.observed = cfg
 
-        result = Result(text: String(
+        result = Outcome(text: String(
             format: """
             headForwardLocal = (%+.3f, %+.3f, %+.3f)
             headUpLocal      = (%+.3f, %+.3f, %+.3f)
@@ -304,13 +288,13 @@ final class FrameProbeModel {
             forward.x, forward.y, forward.z,
             up.x, up.y, up.z,
             right.x, right.y, right.z,
-            referenceUpSign, turnText, rollText), warning: warning)
+            solved.referenceUpSign, turnText, rollText), warning: warning)
     }
 
     // MARK: Averaging
 
     static func meanQuaternion(_ qs: [simd_quatd]) -> simd_quatd {
-        guard let first = qs.first else { return simd_quatd(ix: 0, iy: 0, iz: 0, r: 1) }
+        guard let first = qs.first else { return .identityRotation }
         var acc = SIMD4<Double>.zero
         for q in qs {
             // Align hemispheres before averaging — q and −q are the same rotation.

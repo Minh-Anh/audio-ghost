@@ -1,6 +1,6 @@
 # AudioGhost — living memory
 
-Read this first, then `audioghost-spec.md` for the sections you're touching.
+Read this first, then `audioghost-spec.md` for the sections you're touching. `README.md` has the code walkthrough and the list of known issues.
 
 **Current phase: everything indoors is cleared. FrameProbe done, S1 and S2 passed, calibration
 ritual verified on hardware. The only remaining unknown is the first field walk** (which also
@@ -11,7 +11,7 @@ answers S3–S5). See "Open on device" below.
 ## 1. Build & test
 
 ```bash
-# Unit + integration tests (simulator; 114 tests, ~15 s)
+# Unit + integration tests (simulator; 129 tests)
 xcodebuild -project AudioGhost.xcodeproj -scheme AudioGhost \
   -destination 'platform=iOS Simulator,name=iPhone 17' test
 
@@ -19,7 +19,7 @@ xcodebuild -project AudioGhost.xcodeproj -scheme AudioGhost \
 xcodebuild -project AudioGhost.xcodeproj -scheme AudioGhost -destination 'generic/platform=iOS' build
 ```
 
-- Xcode 26.6 / iOS 26.5 SDK, deployment target **iOS 17.0**, Swift language mode 5 (strict
+- Xcode 27.2 / iOS 27.2 SDK (last verified 2026-11-04), deployment target **iOS 17.0**, Swift language mode 5 (strict
   concurrency `minimal` — CoreMotion/CoreLocation delegate callbacks are not worth fighting).
 - The Xcode project uses **file-system synchronized groups**: new files under `AudioGhost/` and
   `AudioGhostTests/` are picked up automatically, no `.pbxproj` editing needed.
@@ -111,7 +111,7 @@ Record the numbers here once measured, with the date.
 | S2 | OS spatializer double-rotating PHASE output | **PASS (2026-07-28).** Head turns sweep the source 1:1, not 2:1, with `automaticHeadTrackingFlags = []` (see the spec correction below). No need for the Control Centre "Spatialize Stereo" workaround. |
 | S3 | GPS quality at the venue | NOT RUN. |
 | S4 | Compass usable at the venue | NOT RUN. Fallback already shipped: course-based coarse seeding means the ritual is an accuracy upgrade, not a hard dependency. |
-| S5 | Yaw drift rate of these AirPods | NOT RUN. `Tuning.courseGain = 0.02` is the spec default; the HUD's `courseErr` is the tuning signal. |
+| S5 | Yaw drift rate of these AirPods | NOT RUN. `courseGain = 0.02` is the spec default; the HUD's `courseErr` is the tuning signal. |
 
 ## 4. Deviations from the spec, dated
 
@@ -166,10 +166,28 @@ Record the numbers here once measured, with the date.
   a real alert in the test host app (which then sat queued in SpringBoard across launches and
   looked like a launch-time bug). The prompt now belongs to an explicit "Drop here" tap.
 
+- **2026-11-04 — behaviour-preserving simplification pass.** Verified by the full suite, Debug and
+  Release device builds, and an old-vs-new reducer comparison over all 1,224 state/event/calibration
+  combinations (no differences beyond the removed effects). The measured frame and `Tuning` overrides
+  saved on the device still load (now pinned by tests).
+  - `Tuning` is now a struct read as `Tuning.current.x`; each default is declared once.
+  - `FixPipeline` is shared: the coordinator owns one and every location provider pushes into it.
+    It fires `onFix`/`onRejected` and is tracking-queue only, so its lock is gone. `LocationProviding`
+    is now just `start`/`stop`.
+  - Removed the `.seedOrigin` and `.log` effects and the never-sent `.calibrationInvalidated` event.
+    The ghost is placed once, in `handle(fix)`, from `Ghost.enuPosition(origin:)`.
+  - Removed `FrameConfig.mountingCorrection` (the slot is on `HeadTrackingService`). New `FrameConfig`
+    fields must be optional, or the saved measured frame stops decoding.
+  - `Frames.solveSensorFrame` holds the FrameProbe math, so its test now exercises the real code.
+  - Small visible changes: ear height applies at the next session start; the HUD's fix counters now
+    work in desk simulation; CSV note rows `gps stale`/`gps weak`/`gps recovered`/`calibration x` are
+    gone because the `state …` rows already record them.
+
 ## 5. Tuning constants
 
-`AudioGhost/Support/Tuning.swift` is the single source of truth and every value is live-editable
-in the field from **Debug HUD → Tuning** (persisted, "Reset to spec defaults" restores §12).
+`AudioGhost/Support/Tuning.swift` is the single source of truth, read as `Tuning.current.x`. The
+key values are live-editable in the field from **Debug HUD → Tuning** (persisted, "Reset to spec
+defaults" restores §12).
 Current defaults are exactly the spec's §12 table, plus `weakAccuracy = 15 m` (see deviation
 above) and `uiSnapshotHz = 4`.
 
@@ -186,7 +204,7 @@ AudioGhost/
 │   ├── Audio/           SpatialAudioEngine (PHASE + near-field clamp), AudioImport, AudioSessionController
 │   └── Session/         SessionCoordinator (heartbeat), SessionReducer (pure), ListenerPose
 ├── Store/               Ghost, GhostStore (ghosts.json + Documents/Audio/)
-├── Support/             Tuning, SessionLogger (CSV), Replay, Permissions, DebugSettings, FrameConfigStore, Log
+├── Support/             Tuning, SessionLogger (CSV), Replay, Permissions, DebugSettings, FrameConfigStore, Log, AppClock
 ├── Resources/           demo-ghost.wav
 └── UI/                  Home, GhostEditor, Calibration, Session, DebugHUD, FrameProbe
 ```
@@ -198,7 +216,7 @@ written on the main queue only; everything else stays on `trackingQueue`.
 
 ## 7. Testing
 
-114 tests, all green in the simulator:
+129 tests, all green in the simulator:
 
 - `WrapMathTests` / `GeoTests` — Appendix A contracts and Appendix B worked vectors.
 - `FrameTests` — the three canonical §6.6 tests, run against **three different sensor-frame
@@ -211,6 +229,7 @@ written on the main queue only; everything else stays on `trackingQueue`.
 - `SessionIntegrationTests` — a full desk run: demo audio → import → store → coordinator with the
   synthetic head and a scripted GPS path → PHASE graph plays → heartbeat rate measured from the
   log rows → CSV exports and parses back as a replay fixture → clean stop.
+- `TuningTests` / `SessionLoggerTests` — override persistence and reset; the CSV ring buffer.
 - `UISmokeTests` — every screen laid out in a hosting controller.
 
 **Desk simulation** (`Home → Developer → Desk simulation`, debug builds): scripted GPS paths

@@ -42,27 +42,17 @@ struct PermissionStatus: Equatable {
     /// Settings once it has requested a permission, so "Open Settings" is useless before that.
     var canRequestLocation: Bool { location == .notDetermined }
     var canRequestMotion: Bool { motion == .notDetermined && headTrackingAvailable }
-}
 
-enum Permissions {
-
-    static func status() -> PermissionStatus {
-        let manager = CLLocationManager()
-        let location: LocationAuthorization
-        switch manager.authorizationStatus {
-        case .authorizedAlways, .authorizedWhenInUse: location = .authorized
-        case .denied: location = .denied
-        case .restricted: location = .restricted
-        default: location = .notDetermined
-        }
-        return PermissionStatus(location: location,
-                                motion: CMHeadphoneMotionManager.authorizationStatus(),
-                                headTrackingAvailable: CMHeadphoneMotionManager().isDeviceMotionAvailable)
+    /// Button title for each row; nil when there is nothing useful to tap (already granted, or
+    /// blocked on hardware).
+    var locationAction: String? {
+        if canRequestLocation { return "Allow" }
+        return locationOK ? nil : "Settings"
     }
 
-    static func openSettings() {
-        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
-        UIApplication.shared.open(url)
+    var motionAction: String? {
+        if canRequestMotion { return "Allow" }
+        return motionOK || !headTrackingAvailable ? nil : "Settings"
     }
 }
 
@@ -75,7 +65,8 @@ enum Permissions {
 @Observable
 final class PermissionCoordinator: NSObject, CLLocationManagerDelegate {
 
-    private(set) var status: PermissionStatus = Permissions.status()
+    private(set) var status = PermissionStatus(location: .notDetermined, motion: .notDetermined,
+                                               headTrackingAvailable: false)
     private(set) var isRequestingMotion = false
 
     @ObservationIgnored private let locationManager = CLLocationManager()
@@ -84,15 +75,23 @@ final class PermissionCoordinator: NSObject, CLLocationManagerDelegate {
     override init() {
         super.init()
         locationManager.delegate = self
+        refresh()
     }
 
     func refresh() {
-        status = Permissions.status()
+        status = PermissionStatus(location: LocationAuthorization(locationManager.authorizationStatus),
+                                  motion: CMHeadphoneMotionManager.authorizationStatus(),
+                                  headTrackingAvailable: headphoneManager.isDeviceMotionAvailable)
+    }
+
+    private func openSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
     }
 
     func requestLocation() {
         guard status.location == .notDetermined else {
-            Permissions.openSettings()
+            openSettings()
             return
         }
         locationManager.requestWhenInUseAuthorization()
@@ -103,7 +102,7 @@ final class PermissionCoordinator: NSObject, CLLocationManagerDelegate {
     /// ask, which is why the UI tells the user to connect them first.
     func requestMotion() {
         guard status.motion == .notDetermined else {
-            Permissions.openSettings()
+            openSettings()
             return
         }
         guard headphoneManager.isDeviceMotionAvailable, !isRequestingMotion else { return }

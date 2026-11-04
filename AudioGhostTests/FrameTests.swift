@@ -297,21 +297,54 @@ final class FrameTests: XCTestCase {
 
         let gravityLevel = level.inverse.act(SIMD3<Double>(0, 0, -1))   // down, in sensor frame
 
-        let solvedUp = simd_normalize(-gravityLevel)
-        let delta = (level.inverse * nod).normalized
-        var solvedRight = -Quat.axis(of: delta)!
-        solvedRight = simd_normalize(solvedRight - solvedUp * simd_dot(solvedRight, solvedUp))
-        let solvedForward = simd_normalize(simd_cross(solvedUp, solvedRight))
+        let solved = Frames.solveSensorFrame(levelAttitude: level, levelGravity: gravityLevel,
+                                             nodDownAttitude: nod)
+        assertVector(solved!.up, truth.up, "solved up", accuracy: 1e-9)
+        assertVector(solved!.right, right, "solved right", accuracy: 1e-9)
+        assertVector(solved!.forward, truth.forward, "solved forward", accuracy: 1e-9)
+        XCTAssertEqual(solved!.referenceUpSign, 1)
+    }
 
-        assertVector(solvedUp, truth.up, "solved up", accuracy: 1e-9)
-        assertVector(solvedRight, right, "solved right", accuracy: 1e-9)
-        assertVector(solvedForward, truth.forward, "solved forward", accuracy: 1e-9)
+    func testFrameProbeSolverRefusesANodThatDidNotMove() {
+        let level = Quat.rotation(angle: 0.3, axis: SIMD3(0, 0, 1))
+        XCTAssertNil(Frames.solveSensorFrame(levelAttitude: level, levelGravity: SIMD3(0, 0, -1),
+                                             nodDownAttitude: level))
+    }
+
+    // MARK: Persistence
+
+    /// The frame measured on the device lives in `UserDefaults` as JSON written by an older build,
+    /// which also carried a `mountingCorrection` field. It must keep decoding: a failure here
+    /// silently throws away the measured frame and falls back to the 90°-wrong defaults.
+    func testPreviouslySavedFrameConfigStillDecodes() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "test-\(UUID())"))
+        let saved = """
+        {"headForwardLocal":[-0.295,0.94,-0.174],"headUpLocal":[-0.219,0.11,0.969],\
+        "referenceUpSign":1,"mountingCorrection":[0,0,0,1],"flipEast":false,"flipNorth":false,\
+        "conjugateListener":true,"flipYawOffsetSign":false,"probedAt":806932800,"probeNotes":"field"}
+        """
+        defaults.set(Data(saved.utf8), forKey: "FrameConfig.v1")
+
+        let config = FrameConfigStore(defaults: defaults).config
+        XCTAssertEqual(config.headForwardLocal, SIMD3(-0.295, 0.94, -0.174))
+        XCTAssertEqual(config.headUpLocal, SIMD3(-0.219, 0.11, 0.969))
+        XCTAssertTrue(config.conjugateListener)
+        XCTAssertEqual(config.probeNotes, "field")
+        XCTAssertNotNil(config.probedAt)
+    }
+
+    func testFrameConfigRoundTripsThroughTheStore() throws {
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "test-\(UUID())"))
+        let store = FrameConfigStore(defaults: defaults)
+        store.observed.flipEast = true
+        XCTAssertTrue(store.config.flipEast, "the tracking-queue copy must follow the UI")
+        XCTAssertTrue(FrameConfigStore(defaults: defaults).config.flipEast, "and it must persist")
     }
 
     func testMeanQuaternionIgnoresHemisphereFlips() {
         let a = Quat.rotation(angle: 0.5, axis: SIMD3(0, 0, 1))
         let negated = simd_quatd(vector: -a.vector)
         let mean = FrameProbeModel.meanQuaternion([a, negated, a])
-        XCTAssertEqual(Quat.angle(between: mean, b: a), 0, accuracy: 1e-9)
+        XCTAssertEqual(abs(simd_dot(mean.vector, a.vector)), 1, accuracy: 1e-9)
     }
 }

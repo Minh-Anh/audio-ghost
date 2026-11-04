@@ -3,7 +3,7 @@ import SwiftUI
 /// Everything the §15 troubleshooting tree asks you to look at, in one place (spec §9.5).
 struct DebugHUDView: View {
     @Environment(AppEnvironment.self) private var app
-    @State private var exportURL: URL?
+    @State private var export: ExportItem?
     @State private var showTuning = false
     @State private var showFlips = false
 
@@ -42,7 +42,7 @@ struct DebugHUDView: View {
             }
 
             HStack {
-                Button("Export CSV") { export() }
+                Button("Export CSV") { exportCSV() }
                 Button("Sign flips") { showFlips = true }
                 Button("Tuning") { showTuning = true }
             }
@@ -54,15 +54,12 @@ struct DebugHUDView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .sheet(isPresented: $showTuning) { TuningSheet() }
         .sheet(isPresented: $showFlips) { SignFlipSheet() }
-        .sheet(item: Binding(get: { exportURL.map(ExportItem.init) },
-                             set: { _ in exportURL = nil })) { item in
-            ShareSheet(url: item.url)
-        }
+        .sheet(item: $export) { item in ShareSheet(url: item.url) }
     }
 
-    private func export() {
+    private func exportCSV() {
         do {
-            exportURL = try app.session.logger.exportCSV()
+            export = ExportItem(url: try app.session.logger.exportCSV())
         } catch {
             Log.error("CSV export failed: \(error.localizedDescription)")
         }
@@ -107,7 +104,8 @@ struct ShareSheet: UIViewControllerRepresentable {
 /// Live overrides for every §12 constant, so field tuning doesn't require a rebuild.
 struct TuningSheet: View {
     @Environment(\.dismiss) private var dismiss
-    @State private var version = 0
+    /// `Tuning.current` isn't observable, so the sheet edits its own copy and writes through.
+    @State private var tuning = Tuning.current
 
     var body: some View {
         NavigationStack {
@@ -117,30 +115,39 @@ struct TuningSheet: View {
                         HStack {
                             Text(knob.label).font(.footnote)
                             Spacer()
-                            Text(knob.isAngle
-                                 ? String(format: "%.0f°", knob.get().degrees)
-                                 : String(format: "%.3f", knob.get()))
+                            Text(label(for: knob))
                                 .font(.system(.caption, design: .monospaced))
                         }
-                        Slider(value: Binding(get: { knob.get() },
-                                              set: { knob.set($0); Tuning.saveOverrides(); version += 1 }),
-                               in: knob.range)
+                        Slider(value: binding(for: knob), in: knob.range)
                     }
                 }
                 Section {
                     Button("Reset to spec defaults", role: .destructive) {
                         Tuning.resetOverrides()
-                        version += 1
+                        tuning = Tuning.current
                     }
                 }
             }
-            .id(version)
             .navigationTitle("Tuning")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } }
             }
         }
+    }
+
+    private func label(for knob: Tuning.Knob) -> String {
+        let value = tuning[keyPath: knob.path]
+        return knob.isAngle ? String(format: "%.0f°", value.degrees) : String(format: "%.3f", value)
+    }
+
+    private func binding(for knob: Tuning.Knob) -> Binding<Double> {
+        Binding(get: { tuning[keyPath: knob.path] },
+                set: { value in
+                    tuning[keyPath: knob.path] = value
+                    Tuning.current[keyPath: knob.path] = value
+                    Tuning.saveOverrides()
+                })
     }
 }
 

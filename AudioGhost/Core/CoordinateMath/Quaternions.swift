@@ -47,22 +47,12 @@ enum Quat {
         return simd_quatf(ix: Float(n.imag.x), iy: Float(n.imag.y), iz: Float(n.imag.z), r: Float(n.real))
     }
 
-    static func double(_ q: simd_quatf) -> simd_quatd {
-        simd_quatd(ix: Double(q.imag.x), iy: Double(q.imag.y), iz: Double(q.imag.z), r: Double(q.real))
-    }
-
     /// Rigid transform (rotation + translation, no scale ever — PHASE requires rigid listener
     /// and source transforms, spec §5.2).
     static func transform(rotation: simd_quatf, position: SIMD3<Float>) -> simd_float4x4 {
         var m = simd_float4x4(rotation.normalized)
         m.columns.3 = SIMD4<Float>(position.x, position.y, position.z, 1)
         return m
-    }
-
-    /// Angle in radians between two rotations (used by FrameProbe and staleness diagnostics).
-    static func angle(between a: simd_quatd, b: simd_quatd) -> Double {
-        let d = (a.normalized.inverse * b.normalized).normalized
-        return 2 * acos(clamp(abs(d.real), 0, 1))
     }
 
     /// Rotation axis of a quaternion, or nil if the rotation is (numerically) identity.

@@ -7,7 +7,6 @@ struct HomeView: View {
     @State private var showSession = false
     @State private var showFrameProbe = false
     @State private var permissions = PermissionCoordinator()
-    @State private var startError: String?
     @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
@@ -19,7 +18,8 @@ struct HomeView: View {
                             .contentShape(Rectangle())
                             .onTapGesture { editing = ghost }
                         Button {
-                            startSession(ghost)
+                            app.session.start(ghost: ghost)
+                            showSession = true
                         } label: {
                             Label("Start session", systemImage: "play.circle.fill")
                                 .font(.headline)
@@ -52,8 +52,7 @@ struct HomeView: View {
                         title: "Location",
                         detail: permissions.status.locationLabel,
                         ok: permissions.status.locationOK,
-                        action: permissions.status.canRequestLocation ? "Allow" :
-                            (permissions.status.locationOK ? nil : "Settings")) {
+                        action: permissions.status.locationAction) {
                         permissions.requestLocation()
                     }
 
@@ -62,9 +61,7 @@ struct HomeView: View {
                         title: "Head tracking",
                         detail: permissions.status.motionLabel,
                         ok: permissions.status.motionOK,
-                        action: permissions.status.canRequestMotion ? "Allow" :
-                            (permissions.status.motionOK || !permissions.status.headTrackingAvailable
-                             ? nil : "Settings")) {
+                        action: permissions.status.motionAction) {
                         permissions.requestMotion()
                     }
 
@@ -98,26 +95,12 @@ struct HomeView: View {
             .fullScreenCover(isPresented: $showSession) {
                 SessionScreenView()
             }
-            .alert("Can't start", isPresented: .constant(startError != nil)) {
-                Button("OK") { startError = nil }
-            } message: {
-                Text(startError ?? "")
-            }
             .onAppear { permissions.refresh() }
             .onChange(of: scenePhase) { _, phase in
                 // Coming back from Settings, or plugging in AirPods, must update the rows.
                 if phase == .active { permissions.refresh() }
             }
         }
-    }
-
-    private func startSession(_ ghost: Ghost) {
-        guard ghost.isPlayable else {
-            startError = "This ghost needs an audio file and a location first."
-            return
-        }
-        app.session.start(ghost: ghost)
-        showSession = true
     }
 }
 

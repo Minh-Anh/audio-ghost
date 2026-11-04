@@ -7,7 +7,7 @@ struct Ghost: Codable, Identifiable, Equatable {
     var latitude: Double = 0            // WGS84 degrees
     var longitude: Double = 0
     /// Meters above the ground the *listener* is standing on (§5.4). Rendered height is
-    /// `heightAboveGround − Tuning.listenerEarHeight`.
+    /// `heightAboveGround − listenerEarHeight`.
     var heightAboveGround: Double = 1.6
     /// Relative to Documents/Audio/
     var audioFileName: String = ""
@@ -22,6 +22,14 @@ struct Ghost: Codable, Identifiable, Equatable {
     var coordinate: Geo.Coordinate {
         get { Geo.Coordinate(latitude: latitude, longitude: longitude) }
         set { latitude = newValue.latitude; longitude = newValue.longitude }
+    }
+
+    /// This ghost's position in the session's ENU frame. Horizontal position comes from geodesy;
+    /// height is flat-ground and relative to the listener's ears (§5.4), never from GPS altitude.
+    func enuPosition(origin: Geo.Coordinate) -> SIMD3<Double> {
+        var enu = Geo.enu(of: coordinate, origin: origin)
+        enu.z = heightAboveGround - Tuning.current.listenerEarHeight
+        return enu
     }
 
     var hasAudio: Bool { !audioFileName.isEmpty }

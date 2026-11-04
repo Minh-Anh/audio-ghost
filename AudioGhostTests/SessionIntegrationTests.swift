@@ -39,11 +39,11 @@ final class SessionIntegrationTests: XCTestCase {
     // MARK: Import pipeline
 
     func testImportProducesAMonoNormalisedAsset() throws {
-        let imported = try AudioImport.importFile(from: demoURL(), into: store.audioDirectoryURL)
+        let imported = try AudioImport.importFile(from: demoURL(), into: store.audioDirectory)
         XCTAssertEqual(imported.duration, 6, accuracy: 0.05)
         XCTAssertTrue(imported.fileName.hasSuffix(".caf"))
 
-        let url = store.audioDirectoryURL.appendingPathComponent(imported.fileName)
+        let url = store.audioDirectory.appendingPathComponent(imported.fileName)
         XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
 
         let file = try AVAudioFile(forReading: url)
@@ -60,7 +60,7 @@ final class SessionIntegrationTests: XCTestCase {
     func testImportRejectsAnEmptyFile() throws {
         let empty = directory.appendingPathComponent("empty.wav")
         try Data().write(to: empty)
-        XCTAssertThrowsError(try AudioImport.importFile(from: empty, into: store.audioDirectoryURL))
+        XCTAssertThrowsError(try AudioImport.importFile(from: empty, into: store.audioDirectory))
     }
 
     // MARK: Store
@@ -77,7 +77,7 @@ final class SessionIntegrationTests: XCTestCase {
     }
 
     func testDeleteRemovesTheAudioFile() throws {
-        let imported = try AudioImport.importFile(from: demoURL(), into: store.audioDirectoryURL)
+        let imported = try AudioImport.importFile(from: demoURL(), into: store.audioDirectory)
         var ghost = Ghost(name: "Doomed", latitude: 1, longitude: 1)
         ghost.audioFileName = imported.fileName
         store.upsert(ghost)
@@ -90,7 +90,7 @@ final class SessionIntegrationTests: XCTestCase {
     // MARK: The whole pipeline
 
     func testDeskRunReachesAwaitingCalibrationAndPlays() throws {
-        let imported = try AudioImport.importFile(from: demoURL(), into: store.audioDirectoryURL)
+        let imported = try AudioImport.importFile(from: demoURL(), into: store.audioDirectory)
         var ghost = Ghost(name: "Desk ghost", latitude: 43.949317, longitude: 4.805528)
         ghost.audioFileName = imported.fileName
         ghost.heightAboveGround = 3
@@ -122,7 +122,7 @@ final class SessionIntegrationTests: XCTestCase {
         expect("snapshot has geometry", timeout: 5) { session.snapshot.render.trueDistance > 50 }
         XCTAssertEqual(session.snapshot.render.bearing, 0, accuracy: (12.0).radians,
                        "the ghost must bear roughly north of a listener approaching from the south")
-        XCTAssertEqual(session.snapshot.render.elevation, 3 - Tuning.listenerEarHeight, accuracy: 1e-6)
+        XCTAssertEqual(session.snapshot.render.elevation, 3 - Tuning.current.listenerEarHeight, accuracy: 1e-6)
         // The heartbeat's real rate, measured from the log rows rather than trusted from a
         // provider-reported number: the spec marks ~25 Hz as [EMPIRICAL].
         let rowsBefore = session.logger.count
@@ -157,12 +157,12 @@ final class SessionIntegrationTests: XCTestCase {
     /// Weak-but-usable fixes must produce `degraded(.accuracyPoor)` — the "GPS is weak here"
     /// banner — rather than being masked by the staleness path or clearing themselves.
     func testSustainedWeakFixesDegradeTheSession() throws {
-        let imported = try AudioImport.importFile(from: demoURL(), into: store.audioDirectoryURL)
+        let imported = try AudioImport.importFile(from: demoURL(), into: store.audioDirectory)
         var ghost = Ghost(name: "Weak GPS", latitude: 43.949317, longitude: 4.805528)
         ghost.audioFileName = imported.fileName
         store.upsert(ghost)
 
-        Tuning.accuracyPoorTimeout = 0.5          // 15 s is correct in the field, not in a test
+        Tuning.current.accuracyPoorTimeout = 0.5          // 15 s is correct in the field, not in a test
         defer { Tuning.resetOverrides() }
 
         let debug = DebugSettings()

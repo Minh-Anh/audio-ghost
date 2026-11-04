@@ -1,42 +1,12 @@
 import Foundation
 import simd
 
-/// The per-fix acceptance + smoothing pipeline of spec §5.3, factored out of `LocationService`
-/// so that the scripted and replay providers exercise *exactly* the same code path — a desk
-/// simulation that skips the filter proves nothing.
+/// The per-fix acceptance + smoothing pipeline of spec §5.3. Every location source — real, scripted
+/// or replayed — pushes `RawFix`es in here and nothing else, so a desk simulation exercises
+/// *exactly* the code path a field walk does. One that skipped the filter would prove nothing.
+///
+/// Tracking queue only: both `ingest` and every reader run there, so no lock is needed.
 final class FixPipeline {
-
-    private let filter: PositionFilter
-    private let lock = NSLock()
-    private var _origin: Geo.Coordinate?
-    private var _latest: SmoothedFix?
-
-    private(set) var acceptedCount = 0
-    private(set) var rejectedCount = 0
-
-    init(filter: PositionFilter = ExponentialPositionFilter()) {
-        self.filter = filter
-    }
-
-    var origin: Geo.Coordinate? {
-        lock.lock(); defer { lock.unlock() }
-        return _origin
-    }
-
-    var latest: SmoothedFix? {
-        lock.lock(); defer { lock.unlock() }
-        return _latest
-    }
-
-    func reset() {
-        lock.lock()
-        _origin = nil
-        _latest = nil
-        acceptedCount = 0
-        rejectedCount = 0
-        lock.unlock()
-        filter.reset()
-    }
 
     enum Rejection: Error, Equatable {
         case invalidAccuracy
@@ -54,41 +24,67 @@ final class FixPipeline {
         }
     }
 
-    /// Returns the accepted smoothed fix, or the reason it was rejected.
+    var onFix: ((SmoothedFix) -> Void)?
+    var onRejected: ((Rejection) -> Void)?
+
+    /// The newest accepted fix.
+    private(set) var latest: SmoothedFix?
+    /// The session's ENU origin: the first accepted fix.
+    private(set) var origin: Geo.Coordinate?
+    private(set) var acceptedCount = 0
+    private(set) var rejectedCount = 0
+
+    private let filter: PositionFilter
+
+    init(filter: PositionFilter = ExponentialPositionFilter()) {
+        self.filter = filter
+    }
+
+    /// Forgets the origin and filter state; the next accepted fix seeds a new origin.
+    func reset() {
+        origin = nil
+        latest = nil
+        acceptedCount = 0
+        rejectedCount = 0
+        filter.reset()
+    }
+
+    /// Runs one raw fix through the gates and the filter, updates the counters and `latest`, and
+    /// fires `onFix` or `onRejected`. The result is also returned, for tests.
+    @discardableResult
     func ingest(_ fix: RawFix, now: TimeInterval = AppClock.now) -> Result<SmoothedFix, Rejection> {
-        if fix.horizontalAccuracy < 0 { return fail(.invalidAccuracy) }
-        if fix.horizontalAccuracy > Tuning.maxAcceptableAccuracy {
-            return fail(.poorAccuracy(fix.horizontalAccuracy))
+        let result = evaluate(fix, now: now)
+        switch result {
+        case .success(let smoothed):
+            latest = smoothed
+            acceptedCount += 1
+            onFix?(smoothed)
+        case .failure(let rejection):
+            rejectedCount += 1
+            onRejected?(rejection)
+        }
+        return result
+    }
+
+    private func evaluate(_ fix: RawFix, now: TimeInterval) -> Result<SmoothedFix, Rejection> {
+        if fix.horizontalAccuracy < 0 { return .failure(.invalidAccuracy) }
+        if fix.horizontalAccuracy > Tuning.current.maxAcceptableAccuracy {
+            return .failure(.poorAccuracy(fix.horizontalAccuracy))
         }
         let age = abs(now - fix.timestamp)
-        if age > 5 { return fail(.stale(age)) }
+        if age > Tuning.current.maxFixAge { return .failure(.stale(age)) }
 
-        lock.lock()
-        if _origin == nil { _origin = fix.coordinate }
-        let origin = _origin!
-        lock.unlock()
+        let origin = self.origin ?? fix.coordinate
+        self.origin = origin
 
         let rawENU = Geo.enu(of: fix.coordinate, origin: origin)
         let outcome = filter.update(rawENU: rawENU, accuracy: fix.horizontalAccuracy, time: fix.timestamp)
-        guard outcome != .heldAsOutlier else { return fail(.teleportCandidate) }
+        guard outcome != .heldAsOutlier else { return .failure(.teleportCandidate) }
 
-        let smoothed = SmoothedFix(origin: origin,
-                                   rawENU: rawENU,
-                                   smoothedENU: filter.position,
-                                   velocityENU: filter.velocity,
-                                   horizontalAccuracy: fix.horizontalAccuracy,
-                                   timestamp: fix.timestamp,
-                                   raw: fix,
-                                   snapped: outcome == .snapped)
-        lock.lock()
-        _latest = smoothed
-        acceptedCount += 1
-        lock.unlock()
-        return .success(smoothed)
-    }
-
-    private func fail(_ r: Rejection) -> Result<SmoothedFix, Rejection> {
-        lock.lock(); rejectedCount += 1; lock.unlock()
-        return .failure(r)
+        return .success(SmoothedFix(origin: origin,
+                                    rawENU: rawENU,
+                                    smoothedENU: filter.position,
+                                    velocityENU: filter.velocity,
+                                    raw: fix))
     }
 }

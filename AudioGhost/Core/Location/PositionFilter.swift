@@ -22,16 +22,16 @@ struct SmoothedFix: Equatable {
     var rawENU: SIMD3<Double>
     var smoothedENU: SIMD3<Double>
     var velocityENU: SIMD3<Double>
-    var horizontalAccuracy: Double
-    var timestamp: TimeInterval
     var raw: RawFix
-    var snapped: Bool = false
+
+    var horizontalAccuracy: Double { raw.horizontalAccuracy }
+    var timestamp: TimeInterval { raw.timestamp }
 
     /// Dead-reckoned position at `time` (spec §5.5). Extrapolation freezes after
-    /// `Tuning.deadReckonMax` so stale velocity cannot walk the listener away.
+    /// `deadReckonMax` so stale velocity cannot walk the listener away.
     func predictedENU(at time: TimeInterval) -> SIMD3<Double> {
         let age = max(0, time - timestamp)
-        return smoothedENU + velocityENU * min(age, Tuning.deadReckonMax)
+        return smoothedENU + velocityENU * min(age, Tuning.current.deadReckonMax)
     }
 }
 
@@ -49,7 +49,6 @@ enum FilterOutcome: Equatable {
 protocol PositionFilter: AnyObject {
     var position: SIMD3<Double> { get }
     var velocity: SIMD3<Double> { get }
-    var hasStarted: Bool { get }
     func reset()
     @discardableResult
     func update(rawENU: SIMD3<Double>, accuracy: Double, time: TimeInterval) -> FilterOutcome
@@ -60,61 +59,56 @@ final class ExponentialPositionFilter: PositionFilter {
 
     private(set) var position: SIMD3<Double> = .zero
     private(set) var velocity: SIMD3<Double> = .zero
-    private(set) var hasStarted = false
 
-    private var lastTime: TimeInterval = 0
+    /// Nil until the first fix.
+    private var lastTime: TimeInterval?
     private var teleportStreak = 0
 
     func reset() {
         position = .zero
         velocity = .zero
-        hasStarted = false
-        lastTime = 0
+        lastTime = nil
         teleportStreak = 0
     }
 
     @discardableResult
     func update(rawENU: SIMD3<Double>, accuracy: Double, time: TimeInterval) -> FilterOutcome {
-        guard hasStarted else {
-            position = rawENU
-            velocity = .zero
-            lastTime = time
-            hasStarted = true
-            return .snapped
-        }
+        guard let lastTime else { return snap(to: rawENU, time: time) }
 
-        let dt = max(1e-3, time - lastTime)
-        let previous = position
-
-        // 2. Teleport check — three consecutive wild fixes mean the filter is wrong, not the GPS.
-        let jump = Geo.horizontalLength(rawENU - position)
-        if jump > Tuning.teleportDistance {
+        // Teleport check — three consecutive wild fixes mean the filter is wrong, not the GPS.
+        if Geo.horizontalLength(rawENU - position) > Tuning.current.teleportDistance {
             teleportStreak += 1
-            if teleportStreak >= Tuning.teleportCount {
+            if teleportStreak >= Tuning.current.teleportCount {
                 teleportStreak = 0
-                position = rawENU
-                velocity = .zero
-                lastTime = time
-                return .snapped
+                return snap(to: rawENU, time: time)
             }
             // Suspect but not yet confirmed: ignore this fix entirely.
             return .heldAsOutlier
         }
         teleportStreak = 0
 
-        // 3. Exponential smoothing, τ scaled by reported accuracy.
-        let tau = Tuning.tauMin + (Tuning.tauMax - Tuning.tauMin)
+        // Exponential smoothing, τ scaled by reported accuracy.
+        let dt = max(1e-3, time - lastTime)
+        let previous = position
+        let tau = Tuning.current.tauMin + (Tuning.current.tauMax - Tuning.current.tauMin)
             * clamp((accuracy - 5) / 25, 0, 1)
         let alpha = 1 - exp(-dt / max(1e-3, tau))
         position += (rawENU - position) * alpha
 
-        // 4. Velocity for per-tick interpolation, clamped to a walking-plausible speed.
+        // Velocity for per-tick interpolation, clamped to a walking-plausible speed.
         var v = (position - previous) / dt
         let speed = simd_length(v)
-        if speed > Tuning.maxFixSpeed { v *= Tuning.maxFixSpeed / speed }
+        if speed > Tuning.current.maxFixSpeed { v *= Tuning.current.maxFixSpeed / speed }
         velocity = v
 
-        lastTime = time
+        self.lastTime = time
         return .smoothed
+    }
+
+    private func snap(to rawENU: SIMD3<Double>, time: TimeInterval) -> FilterOutcome {
+        position = rawENU
+        velocity = .zero
+        lastTime = time
+        return .snapped
     }
 }

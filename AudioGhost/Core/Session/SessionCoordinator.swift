@@ -5,7 +5,6 @@ import simd
 /// Throttled view of the tracking state for the UI (4 Hz — spec §3.3).
 struct SessionSnapshot: Equatable {
     var enuPosition: SIMD3<Double> = .zero
-    var rawENU: SIMD3<Double> = .zero
     var horizontalAccuracy: Double = 0
     var fixAge: Double = 0
     var acceptedFixes = 0
@@ -34,8 +33,8 @@ struct SessionSnapshot: Equatable {
 /// The app's beating heart (spec §8): owns the tracking queue, drives the state machine, fuses
 /// pose on every headphone-motion callback, and keeps the UI fed with throttled snapshots.
 ///
-/// Threading contract: everything except `state`/`snapshot`/`needsCalibration` lives on
-/// `trackingQueue`; those three are only ever written on the main queue.
+/// Threading contract: `state`/`snapshot`/`needsCalibration` are only ever written on the main
+/// queue, and so are the provider references. The rest of the mutable state lives on `trackingQueue`.
 @Observable
 final class SessionCoordinator {
 
@@ -49,50 +48,49 @@ final class SessionCoordinator {
 
     // MARK: Collaborators
 
-    @ObservationIgnored let trackingQueue: DispatchQueue
-    @ObservationIgnored private(set) var locationProvider: LocationProviding
-    @ObservationIgnored private(set) var headProvider: HeadPoseProviding
-    @ObservationIgnored let calibration: CalibrationService
-    @ObservationIgnored let audioEngine: SpatialAudioEngine
-    @ObservationIgnored let audioSession: AudioSessionController
-    @ObservationIgnored let logger: SessionLogger
+    @ObservationIgnored let logger = SessionLogger()
+    @ObservationIgnored private let trackingQueue: DispatchQueue
+    @ObservationIgnored private let calibration = CalibrationService()
+    @ObservationIgnored private let audioEngine = SpatialAudioEngine()
+    @ObservationIgnored private let audioSession = AudioSessionController()
+    /// Whatever the location source is, its fixes come through here.
+    @ObservationIgnored private let fixes = FixPipeline()
     @ObservationIgnored private let store: GhostStore
     @ObservationIgnored private let debug: DebugSettings
     @ObservationIgnored private let frames: FrameConfigStore
+    /// Nil until the first session starts.
+    @ObservationIgnored private var locationProvider: LocationProviding?
+    @ObservationIgnored private var headProvider: HeadPoseProviding?
+
+    // MARK: Main-queue state
+
+    @ObservationIgnored private var audioURL: URL?
+    @ObservationIgnored private var restartAttempted = false
 
     // MARK: Tracking-queue state
 
-    @ObservationIgnored private var pose = ListenerPose.identity
-    @ObservationIgnored private var lastAttitudeYaw: Double = 0
-    @ObservationIgnored private var lastSnapshotTime: TimeInterval = 0
-    @ObservationIgnored private var lastFixSeen: TimeInterval = 0
-    @ObservationIgnored private var poorAccuracySince: TimeInterval?
-    @ObservationIgnored private var gpsDegraded = false
-    @ObservationIgnored private var ghostENU: SIMD3<Double> = .zero
-    @ObservationIgnored private var lastRejectionReason = ""
-    @ObservationIgnored private var restartAttempted = false
     /// Tracking-queue copy of the ghost, so the heartbeat never reads observable state.
     @ObservationIgnored private var trackingGhost: Ghost?
+    /// Nil until the session's first accepted fix fixes the ENU origin.
+    @ObservationIgnored private var ghostENU: SIMD3<Double>?
+    @ObservationIgnored private var lastAttitudeYaw: Double = 0
+    @ObservationIgnored private var lastSnapshotTime: TimeInterval = 0
+    @ObservationIgnored private var poorAccuracySince: TimeInterval?
+    @ObservationIgnored private var gpsDegraded = false
+    @ObservationIgnored private var lastRejectionReason = ""
 
     init(store: GhostStore, debug: DebugSettings, frames: FrameConfigStore) {
         self.store = store
         self.debug = debug
         self.frames = frames
-        let queue = DispatchQueue(label: "com.audioghost.tracking", qos: .userInteractive)
-        self.trackingQueue = queue
-        self.calibration = CalibrationService()
-        self.audioEngine = SpatialAudioEngine(queue: queue)
-        self.audioSession = AudioSessionController()
-        self.logger = SessionLogger()
-        self.locationProvider = LocationService(queue: queue)
-        self.headProvider = HeadTrackingService(queue: queue)
+        self.trackingQueue = DispatchQueue(label: "com.audioghost.tracking", qos: .userInteractive)
+        fixes.onFix = { [weak self] fix in self?.handle(fix) }
+        fixes.onRejected = { [weak self] rejection in self?.lastRejectionReason = rejection.reason }
         wireAudioSession()
     }
 
     /// Location service, when it is the real one — used by the calibration ritual for headings.
     var headingProvider: HeadingProviding? { locationProvider as? HeadingProviding }
-
-    var isRunning: Bool { state.isActive }
 
     // MARK: Public control
 
@@ -103,18 +101,21 @@ final class SessionCoordinator {
         }
         activeGhost = ghost
         store.isLocked = true
-        pendingAudioURL = url
+        audioURL = url
         restartAttempted = false
         trackingQueue.async { [weak self] in
-            self?.trackingGhost = ghost
-            self?.ghostENU = .zero
+            guard let self else { return }
+            self.trackingGhost = ghost
+            self.ghostENU = nil
+            self.fixes.reset()
+            self.gpsDegraded = false
+            self.poorAccuracySince = nil
         }
         send(.startRequested)
     }
 
     func stop() {
         send(.stopRequested)
-        store.isLocked = false
         activeGhost = nil
     }
 
@@ -133,8 +134,6 @@ final class SessionCoordinator {
     var currentAttitudeYaw: Double {
         trackingQueue.sync { lastAttitudeYaw }
     }
-
-    @ObservationIgnored private var pendingAudioURL: URL?
 
     // MARK: State machine plumbing
 
@@ -161,7 +160,6 @@ final class SessionCoordinator {
         switch effect {
         case .startServices: startServices()
         case .stopServices: stopServices()
-        case .seedOrigin: seedOrigin()
         case .startAudio: startAudio()
         case .pauseAudio: trackingQueue.async { [weak self] in self?.audioEngine.pauseEvent() }
         case .resumeAudio: resumeAudio()
@@ -170,8 +168,6 @@ final class SessionCoordinator {
             needsCalibration = true
         case .promptCalibration:
             needsCalibration = true
-        case .log(let m):
-            logger.event(m, state: "\(state)", quality: calibration.quality.rawValue)
         }
     }
 
@@ -179,9 +175,6 @@ final class SessionCoordinator {
 
     private func startServices() {
         logger.start()
-        lastFixSeen = 0
-        gpsDegraded = false
-        poorAccuracySince = nil
 
         do {
             try audioSession.activate()
@@ -197,14 +190,12 @@ final class SessionCoordinator {
 
         // Head tracking — the heartbeat.
         let head: HeadPoseProviding = debug.useSyntheticHeadTracking
-            ? SyntheticHeadPoseProvider(queue: trackingQueue, frameConfig: { [weak self] in
-                self?.frames.config ?? FrameConfig() })
+            ? SyntheticHeadPoseProvider(queue: trackingQueue, frameConfig: { [frames] in frames.config })
             : HeadTrackingService(queue: trackingQueue)
         headProvider = head
         head.onSample = { [weak self] sample in self?.handle(sample) }
         head.onConnectionChange = { [weak self] connected in
-            guard let self else { return }
-            self.send(connected ? .airpodsReconnected : .airpodsDisconnected)
+            self?.send(connected ? .airpodsReconnected : .airpodsDisconnected)
         }
         do {
             try head.start()
@@ -225,18 +216,15 @@ final class SessionCoordinator {
     private func startLocation() {
         let location: LocationProviding
         if let path = debug.scriptedPath, let ghost = activeGhost {
-            let scripted = ScriptedLocationProvider(ghost: ghost.coordinate, path: path, queue: trackingQueue)
+            let scripted = ScriptedLocationProvider(ghost: ghost.coordinate, path: path,
+                                                    queue: trackingQueue, pipeline: fixes)
             scripted.noiseSigma = debug.scriptedNoiseSigma
             scripted.reportedAccuracy = debug.scriptedReportedAccuracy
             location = scripted
         } else {
-            location = LocationService(queue: trackingQueue)
+            location = LocationService(queue: trackingQueue, pipeline: fixes)
         }
         locationProvider = location
-        location.onFix = { [weak self] fix in self?.handle(fix) }
-        location.onRejectedFix = { [weak self] _, reason in
-            self?.trackingQueue.async { self?.lastRejectionReason = reason }
-        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
@@ -251,8 +239,8 @@ final class SessionCoordinator {
     }
 
     private func stopServices() {
-        headProvider.stop()
-        locationProvider.stop()
+        headProvider?.stop()
+        locationProvider?.stop()
         trackingQueue.async { [weak self] in self?.audioEngine.stop() }
         audioSession.deactivate()
         logger.stop()
@@ -260,37 +248,16 @@ final class SessionCoordinator {
         needsCalibration = false
     }
 
-    private func seedOrigin() {
-        guard let ghost = activeGhost else { return }
-        trackingQueue.async { [weak self] in
-            guard let self, let fix = self.locationProvider.latest else { return }
-            var enu = Geo.enu(of: ghost.coordinate, origin: fix.origin)
-            enu.z = ghost.heightAboveGround - Tuning.listenerEarHeight
-            self.ghostENU = enu
-            self.audioEngine.setGhostENU(enu)
-            Log.info(String(format: "Origin seeded; ghost at E %.1f N %.1f U %.1f", enu.x, enu.y, enu.z))
-        }
-    }
-
     private func startAudio() {
-        guard let ghost = activeGhost, let url = pendingAudioURL else { return }
+        guard let ghost = activeGhost, let url = audioURL else { return }
         let cfg = frames.config
         trackingQueue.async { [weak self] in
             guard let self else { return }
-            var enu = self.ghostENU
-            if let fix = self.locationProvider.latest {
-                enu = Geo.enu(of: ghost.coordinate, origin: fix.origin)
-                enu.z = ghost.heightAboveGround - Tuning.listenerEarHeight
-                self.ghostENU = enu
-            }
             do {
-                try self.audioEngine.start(ghost: ghost, audioURL: url, ghostENU: enu, frameConfig: cfg)
-            } catch let error as SpatialAudioError {
-                if case .assetLoad(let m) = error {
-                    self.send(.assetLoadFailed(m))
-                } else {
-                    self.send(.audioEngineFailed(error.localizedDescription))
-                }
+                try self.audioEngine.start(ghost: ghost, audioURL: url,
+                                           ghostENU: self.ghostENU ?? .zero, frameConfig: cfg)
+            } catch SpatialAudioError.assetLoad(let message) {
+                self.send(.assetLoadFailed(message))
             } catch {
                 self.send(.audioEngineFailed(error.localizedDescription))
             }
@@ -324,56 +291,41 @@ final class SessionCoordinator {
     private func handle(_ sample: HeadSample) {
         let cfg = frames.config
         let now = AppClock.now
+        let fix = fixes.latest
 
         let attitudeYaw = Frames.attitudeYaw(sample.attitude, cfg: cfg, fallback: lastAttitudeYaw)
         lastAttitudeYaw = attitudeYaw
-        let yawOffset = calibration.renderingYawOffset
+        let yawOffset = calibration.yawOffset
         let rotation = Frames.listenerRotation(attitude: sample.attitude, yawOffset: yawOffset, cfg: cfg)
 
-        var position = SIMD3<Double>.zero
-        var accuracy = 0.0
-        var fixTime = 0.0
-        var rawENU = SIMD3<Double>.zero
-        if let fix = locationProvider.latest {
-            position = fix.predictedENU(at: now)
-            accuracy = fix.horizontalAccuracy
-            fixTime = fix.timestamp
-            rawENU = fix.rawENU
-        }
+        let pose = ListenerPose(enuPosition: fix?.predictedENU(at: now) ?? .zero,
+                                headOrientationPHASE: Quat.float(rotation),
+                                horizontalAccuracy: fix?.horizontalAccuracy ?? 0,
+                                motionTimestamp: sample.timestamp,
+                                attitudeYaw: attitudeYaw,
+                                trueYaw: wrapToPi(attitudeYaw + yawOffset),
+                                pitch: Frames.attitudePitch(sample.attitude, cfg: cfg))
 
-        pose = ListenerPose(enuPosition: position,
-                            headOrientationPHASE: Quat.float(rotation),
-                            horizontalAccuracy: accuracy,
-                            motionTimestamp: sample.timestamp,
-                            locationTimestamp: fixTime,
-                            attitudeYaw: attitudeYaw,
-                            trueYaw: wrapToPi(attitudeYaw + yawOffset),
-                            pitch: Frames.attitudePitch(sample.attitude, cfg: cfg))
+        let render = audioEngine.updateListener(pose: pose, now: now, frameConfig: cfg)
 
-        audioEngine.setFrameConfig(cfg)
-        let render = audioEngine.updateListener(pose: pose, now: now)
-
-        checkGPSHealth(now: now, fixTime: fixTime)
-        appendLogRow(now: now, render: render, rawENU: rawENU)
-        publishSnapshotIfDue(now: now, render: render, rawENU: rawENU)
+        checkGPSHealth(now: now, fix: fix)
+        appendLogRow(now: now, pose: pose, fix: fix, render: render)
+        publishSnapshotIfDue(now: now, pose: pose, fix: fix, render: render)
     }
 
-    /// Every accepted fix: refresh the smoothing target, run course-based drift correction.
+    /// Every accepted fix: place the ghost on the first one, then run course-based drift correction.
     private func handle(_ fix: SmoothedFix) {
-        lastFixSeen = fix.timestamp
-        let isStrongFix = fix.horizontalAccuracy <= Tuning.weakAccuracy
+        let isStrongFix = fix.horizontalAccuracy <= Tuning.current.weakAccuracy
         if isStrongFix { poorAccuracySince = nil }
 
-        if ghostENU == .zero, let ghost = trackingGhost {
-            var enu = Geo.enu(of: ghost.coordinate, origin: fix.origin)
-            enu.z = ghost.heightAboveGround - Tuning.listenerEarHeight
+        if ghostENU == nil, let ghost = trackingGhost {
+            let enu = ghost.enuPosition(origin: fix.origin)
             ghostENU = enu
             audioEngine.setGhostENU(enu)
+            Log.info(String(format: "Origin seeded; ghost at E %.1f N %.1f U %.1f", enu.x, enu.y, enu.z))
         }
 
-        let wasValid = calibration.isValid
-        let update = calibration.updateWithCourse(fix: fix, attitudeYawNow: lastAttitudeYaw)
-        if case .seededCoarse = update, !wasValid {
+        if case .seededCoarse = calibration.updateWithCourse(fix: fix, attitudeYawNow: lastAttitudeYaw) {
             send(.calibrationBecameValid(.coarse))
         }
 
@@ -391,12 +343,10 @@ final class SessionCoordinator {
     ///   * `.accuracyPoor` — fixes are arriving, but they are consistently weak for
     ///                       `accuracyPoorTimeout`. This is the "GPS is weak here" case, and it
     ///                       is checked *before* the staleness threshold can mask it.
-    private func checkGPSHealth(now: TimeInterval, fixTime: TimeInterval) {
-        guard state.shouldPlayAudio || state == .awaitingCalibration else { return }
-        guard fixTime > 0 else { return }
-        let age = now - fixTime
+    private func checkGPSHealth(now: TimeInterval, fix: SmoothedFix?) {
+        guard state.shouldPlayAudio || state == .awaitingCalibration, let fix else { return }
 
-        if age > Tuning.gpsStaleTimeout {
+        if now - fix.timestamp > Tuning.current.gpsStaleTimeout {
             if !gpsDegraded {
                 gpsDegraded = true
                 send(.gpsWentStale)
@@ -404,10 +354,9 @@ final class SessionCoordinator {
             return
         }
 
-        let accuracy = locationProvider.latest?.horizontalAccuracy ?? .infinity
-        if accuracy > Tuning.weakAccuracy {
+        if fix.horizontalAccuracy > Tuning.current.weakAccuracy {
             if poorAccuracySince == nil { poorAccuracySince = now }
-            if let since = poorAccuracySince, now - since > Tuning.accuracyPoorTimeout, !gpsDegraded {
+            if let since = poorAccuracySince, now - since > Tuning.current.accuracyPoorTimeout, !gpsDegraded {
                 gpsDegraded = true
                 send(.gpsAccuracyPoor)
             }
@@ -418,11 +367,11 @@ final class SessionCoordinator {
 
     // MARK: Logging & snapshots
 
-    private func appendLogRow(now: TimeInterval, render: RenderState, rawENU: SIMD3<Double>) {
+    private func appendLogRow(now: TimeInterval, pose: ListenerPose, fix: SmoothedFix?, render: RenderState) {
         guard logger.isRecording else { return }
         var r = LogRecord()
         r.state = "\(state)"
-        if let fix = locationProvider.latest {
+        if let fix {
             r.rawLat = fix.raw.coordinate.latitude
             r.rawLon = fix.raw.coordinate.longitude
             r.rawAcc = fix.horizontalAccuracy
@@ -432,51 +381,46 @@ final class SessionCoordinator {
             r.course = fix.raw.course
         }
         r.attYaw = pose.attitudeYaw
-        r.yawOffset = calibration.renderingYawOffset
+        r.yawOffset = calibration.yawOffset
         r.trueYaw = pose.trueYaw
         r.courseErr = calibration.lastCourseError ?? .nan
         r.calibQuality = calibration.quality.rawValue
         r.ghostDist = render.trueDistance
         r.ghostBearing = render.bearing
         r.clampActive = render.clampActive
-        r.motionHz = headProvider.measuredHz
+        r.motionHz = headProvider?.measuredHz ?? 0
         logger.append(r)
     }
 
-    private func publishSnapshotIfDue(now: TimeInterval, render: RenderState, rawENU: SIMD3<Double>) {
-        let interval = 1 / max(1, Tuning.uiSnapshotHz)
-        guard now - lastSnapshotTime >= interval else { return }
+    private func publishSnapshotIfDue(now: TimeInterval, pose: ListenerPose, fix: SmoothedFix?, render: RenderState) {
+        guard now - lastSnapshotTime >= 1 / max(1, Tuning.current.uiSnapshotHz) else { return }
         lastSnapshotTime = now
 
         var s = SessionSnapshot()
         s.enuPosition = pose.enuPosition
-        s.rawENU = rawENU
         s.horizontalAccuracy = pose.horizontalAccuracy
-        s.fixAge = pose.locationTimestamp > 0 ? now - pose.locationTimestamp : .infinity
+        s.fixAge = fix.map { now - $0.timestamp } ?? .infinity
         s.attitudeYaw = pose.attitudeYaw
-        s.yawOffset = calibration.renderingYawOffset
+        s.yawOffset = calibration.yawOffset
         s.trueYaw = pose.trueYaw
         s.pitch = pose.pitch
         s.courseError = calibration.lastCourseError
         s.calibrationQuality = calibration.quality
         s.calibrationAge = calibration.ageSeconds
         s.render = render
-        s.motionHz = headProvider.measuredHz
+        s.motionHz = headProvider?.measuredHz ?? 0
         s.motionAge = now - pose.motionTimestamp
-        s.headphonesConnected = headProvider.isConnected
-        s.rawSmoothedDelta = Geo.horizontalLength(rawENU - pose.enuPosition)
+        s.headphonesConnected = headProvider?.isConnected ?? false
+        s.rawSmoothedDelta = Geo.horizontalLength((fix?.rawENU ?? .zero) - pose.enuPosition)
+        s.acceptedFixes = fixes.acceptedCount
+        s.rejectedFixes = fixes.rejectedCount
         s.lastRejection = lastRejectionReason
-        if let fix = locationProvider.latest { s.course = fix.raw.course }
-        if let service = locationProvider as? LocationService {
-            s.acceptedFixes = service.acceptedCount
-            s.rejectedFixes = service.rejectedCount
-        }
+        s.course = fix?.raw.course ?? -1
 
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            var snapshot = s
-            snapshot.routeName = self.audioSession.currentRouteName
-            self.snapshot = snapshot
+            s.routeName = self.audioSession.currentRouteName
+            self.snapshot = s
         }
     }
 
@@ -488,7 +432,7 @@ final class SessionCoordinator {
         guard state.shouldPlayAudio || state == .awaitingCalibration else { return }
         guard let service = headProvider as? HeadTrackingService, service.isConnected else { return }
         guard let last = service.lastSampleTime else { return }
-        if AppClock.now - last > max(0.5, Tuning.motionStaleTimeout), !restartAttempted {
+        if AppClock.now - last > Tuning.current.motionStaleTimeout, !restartAttempted {
             restartAttempted = true
             Log.info("Motion stream stalled — restarting updates")
             logger.event("motion stalled; restarting")

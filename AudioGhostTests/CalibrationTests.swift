@@ -108,15 +108,13 @@ final class CalibrationTests: XCTestCase {
     func testApplyPreciseOffsetMakesCalibrationValid() {
         let service = CalibrationService()
         XCTAssertFalse(service.isValid)
-        XCTAssertNil(service.yawOffset)
-        XCTAssertEqual(service.renderingYawOffset, 0, "audio still renders while uncalibrated")
+        XCTAssertEqual(service.yawOffset, 0, "audio still renders while uncalibrated")
         service.applyPreciseOffset(0.5)
         XCTAssertEqual(service.quality, .precise)
-        XCTAssertEqual(service.yawOffset ?? 0, 0.5, accuracy: 1e-12)
-        XCTAssertEqual(service.trueYaw(attitudeYaw: 0.25), 0.75, accuracy: 1e-12)
+        XCTAssertEqual(service.yawOffset, 0.5, accuracy: 1e-12)
         service.invalidate()
         XCTAssertEqual(service.quality, .none)
-        XCTAssertNil(service.yawOffset)
+        XCTAssertFalse(service.isValid)
     }
 
     // MARK: Course correction (§6.4)
@@ -126,8 +124,7 @@ final class CalibrationTests: XCTestCase {
         let origin = Geo.Coordinate(latitude: 43.949317, longitude: 4.805528)
         let raw = RawFix(coordinate: origin, horizontalAccuracy: 5, speed: speed,
                          course: courseDeg, courseAccuracy: courseAccuracy, timestamp: t)
-        return SmoothedFix(origin: origin, rawENU: enu, smoothedENU: enu, velocityENU: .zero,
-                           horizontalAccuracy: 5, timestamp: t, raw: raw)
+        return SmoothedFix(origin: origin, rawENU: enu, smoothedENU: enu, velocityENU: .zero, raw: raw)
     }
 
     func testCourseIgnoredBelowMinimumSpeed() {
@@ -135,7 +132,7 @@ final class CalibrationTests: XCTestCase {
         service.applyPreciseOffset(0)
         XCTAssertEqual(service.updateWithCourse(fix: fix(speed: 0.3, courseDeg: 90),
                                                 attitudeYawNow: 0), .ignoredSlow)
-        XCTAssertEqual(service.renderingYawOffset, 0)
+        XCTAssertEqual(service.yawOffset, 0)
     }
 
     func testCourseIgnoredWhenCourseAccuracyIsBad() {
@@ -154,7 +151,7 @@ final class CalibrationTests: XCTestCase {
         let update = service.updateWithCourse(fix: fix(speed: 1.4, courseDeg: 0),
                                               attitudeYawNow: (80.0).radians)
         guard case .ignoredHeadTurned = update else { return XCTFail("expected the gate to fire") }
-        XCTAssertEqual(service.renderingYawOffset, 0, "a glance must not corrupt the offset")
+        XCTAssertEqual(service.yawOffset, 0, "a glance must not corrupt the offset")
     }
 
     func testCourseCorrectsSlowlyTowardsTruth() {
@@ -166,7 +163,7 @@ final class CalibrationTests: XCTestCase {
             _ = service.updateWithCourse(fix: fix(speed: 1.4, courseDeg: 0, t: Double(i)),
                                          attitudeYawNow: drift)
         }
-        XCTAssertEqual(service.renderingYawOffset, -drift, accuracy: (0.5).radians)
+        XCTAssertEqual(service.yawOffset, -drift, accuracy: (0.5).radians)
         XCTAssertEqual(service.quality, .precise, "drift correction must not downgrade quality")
     }
 
@@ -176,7 +173,7 @@ final class CalibrationTests: XCTestCase {
         let err = (10.0).radians
         _ = service.updateWithCourse(fix: fix(speed: 1.4, courseDeg: 0), attitudeYawNow: err)
         // One fix moves the offset by gain × error.
-        XCTAssertEqual(service.renderingYawOffset, -Tuning.courseGain * err, accuracy: 1e-12)
+        XCTAssertEqual(service.yawOffset, -Tuning.current.courseGain * err, accuracy: 1e-12)
         XCTAssertEqual(service.lastCourseError ?? 0, -err, accuracy: 1e-12)
     }
 

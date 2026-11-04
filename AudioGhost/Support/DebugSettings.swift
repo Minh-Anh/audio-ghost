@@ -1,10 +1,9 @@
 import Foundation
 import Observation
 
-/// Debug-build affordances: desk simulation, frame sign flips, tuning overrides.
-/// None of this is reachable in a release build (`AppEnvironment` only creates the debug UI
-/// under `#if DEBUG`), but the flags themselves compile everywhere so the coordinator stays
-/// free of conditional compilation in its own logic.
+/// Debug-build affordances: desk simulation switches read by `SessionCoordinator` at session
+/// start. The UI that changes them only appears when `isDebugBuild` is true, but the flags compile
+/// everywhere so the coordinator stays free of conditional compilation in its own logic.
 @Observable
 final class DebugSettings {
 
@@ -17,8 +16,6 @@ final class DebugSettings {
     var scriptedReportedAccuracy: Double = 8
     /// Don't refuse to start when the route isn't headphones (desk testing on speakers).
     var allowNonHeadphoneRoute = false
-
-    var isSimulating: Bool { useSyntheticHeadTracking || scriptedPath != nil }
 
     static var isDebugBuild: Bool {
         #if DEBUG
